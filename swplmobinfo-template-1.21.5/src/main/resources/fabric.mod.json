@@ -1,0 +1,41 @@
+{
+	"schemaVersion": 1,
+	"id": "swplmobinfo",
+	"version": "${version}",
+	"name": "swplmobinfo",
+	"description": "This is an example description! Tell everyone what your mod is about!",
+	"authors": [
+		"Me!"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/swplmobinfo/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.swplmobinfo.Swplmobinfo"
+		],
+		"client": [
+			"com.swplmobinfo.SwplmobinfoClient"
+		]
+	},
+	"mixins": [
+		"swplmobinfo.mixins.json",
+		{
+			"config": "swplmobinfo.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.16.13",
+		"minecraft": "~1.21.5",
+		"java": ">=21",
+		"fabric-api": "*"
+	},
+	"suggests": {
+		"another-mod": "*"
+	}
+}
