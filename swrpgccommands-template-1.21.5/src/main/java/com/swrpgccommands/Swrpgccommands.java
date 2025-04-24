@@ -42,6 +42,22 @@ public class Swrpgccommands implements ModInitializer {
 						return 1;
 					}));
 
+			// New /coords command to show the player's coordinates (accessible by anyone)
+			dispatcher.register(CommandManager.literal("coords")
+					.executes(context -> {
+						ServerCommandSource source = context.getSource();
+						try {
+							var player = source.getPlayer();
+							double x = player.getX();
+							double y = player.getY();
+							double z = player.getZ();
+							source.sendFeedback(() -> Text.of(String.format("You are at: X: %.1f, Y: %.1f, Z: %.1f", x, y, z)), false);
+						} catch (Exception e) {
+							source.sendFeedback(() -> Text.of("This command can only be used by players."), false);
+						}
+						return 1;
+					}));
+
 			// Refresh command to reload custom commands live (restricted to ops).
 			dispatcher.register(CommandManager.literal("swrrefresh")
 					.requires(source -> source.hasPermissionLevel(2))
