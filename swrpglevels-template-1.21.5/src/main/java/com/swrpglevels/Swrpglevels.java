@@ -52,6 +52,9 @@ public class Swrpglevels implements ModInitializer {
 	private static final Map<UUID, ItemStack> lastCookingResult = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> lastFishCounts = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> lastCampfireCookedFishCounts = new HashMap<>();
+	// For inventory-based checks using maximum-count tracking:
+	private static final Map<UUID, Map<Item, Integer>> maxFurnaceCookedFoodCounts = new HashMap<>();
+	private static final Map<UUID, Map<Item, Integer>> maxFurnaceSmithingFoodCounts = new HashMap<>();
 
 	// Functional interface for updating XP
 	private interface XPUpdater {
@@ -121,6 +124,14 @@ public class Swrpglevels implements ModInitializer {
 			public boolean expandable(){ return config.cookingExpandable; }
 			public int vanillaXP(){ return config.cookingVanillaXP; }
 		});
+		// New: XP updater for smithing.
+		XP_UPDATERS.put("smithing", new XPUpdater() {
+			public int getExp(PlayerStats s){ return s.getSmithingExp(); }
+			public void addExp(PlayerStats s, int xp){ s.addSmithingExp(xp); }
+			public int baseXP(){ return config.smithingBaseXP; }
+			public boolean expandable(){ return config.smithingExpandable; }
+			public int vanillaXP(){ return config.smithingVanillaXP; }
+		});
 	}
 
 	// Standard leveling formula
@@ -140,7 +151,6 @@ public class Swrpglevels implements ModInitializer {
 		if (newLevel > oldLevel) {
 			sp.addExperience(updater.vanillaXP());
 			sp.getWorld().playSound(null, sp.getBlockPos(), SoundEvents.ENTITY_PLAYER_LEVELUP, sp.getSoundCategory(), 1.0F, 1.0F);
-			// Display level-up message in the action bar (center of screen)
 			sp.sendMessage(Text.literal(skill + " leveled up to " + newLevel + "!").formatted(Formatting.GREEN), true);
 		}
 	}
@@ -176,6 +186,8 @@ public class Swrpglevels implements ModInitializer {
 			lastCookingResult.remove(id);
 			lastFishCounts.remove(id);
 			lastCampfireCookedFishCounts.remove(id);
+			maxFurnaceCookedFoodCounts.remove(id);
+			maxFurnaceSmithingFoodCounts.remove(id);
 		});
 	}
 
@@ -213,6 +225,7 @@ public class Swrpglevels implements ModInitializer {
 						"§6Fishing: §a" + s.getFishingExp() + " §6(Level: §a" + getLevelForSkill(s.getFishingExp(), config.fishingBaseXP, config.fishingExpandable) + "§6)\n" +
 						"§6Crafting: §a" + s.getCraftingExp() + " §6(Level: §a" + getLevelForSkill(s.getCraftingExp(), config.craftingBaseXP, config.craftingExpandable) + "§6)\n" +
 						"§6Cooking: §a" + s.getCookingExp() + " §6(Level: §a" + getLevelForSkill(s.getCookingExp(), config.cookingBaseXP, config.cookingExpandable) + "§6)\n" +
+						"§6Smithing: §a" + s.getSmithingExp() + " §6(Level: §a" + getLevelForSkill(s.getSmithingExp(), config.smithingBaseXP, config.smithingExpandable) + "§6)\n" +
 						"§6Mining: §a" + s.getMiningExp() + " §6(Level: §a" + getLevelForSkill(s.getMiningExp(), config.miningBaseXP, config.miningExpandable) + "§6)"
 		);
 	}
@@ -220,17 +233,21 @@ public class Swrpglevels implements ModInitializer {
 	private void registerTickEvents() {
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
 			int t = server.getTicks();
+
+			// Agility XP (sprinting)
 			if (t % 20 == 0)
 				server.getPlayerManager().getPlayerList().forEach(p -> {
 					if (p.isSprinting())
 						awardSkillXP(p, "agility", 1);
 				});
+
+			// Crafting XP check
 			if (t % 2 == 0) {
 				server.getPlayerManager().getPlayerList().forEach(p -> {
 					if (p.currentScreenHandler instanceof CraftingScreenHandler ||
 							p.currentScreenHandler instanceof PlayerScreenHandler ||
 							p.currentScreenHandler instanceof AnvilScreenHandler) {
-						Map<Item,Integer> cur = getInvCounts(p), prev = prevCraftingInvCounts.get(p.getUuid());
+						Map<Item, Integer> cur = getInvCounts(p), prev = prevCraftingInvCounts.get(p.getUuid());
 						if (prev != null)
 							cur.forEach((i, cnt) -> {
 								int d = cnt - prev.getOrDefault(i, 0);
@@ -243,6 +260,8 @@ public class Swrpglevels implements ModInitializer {
 					}
 				});
 			}
+
+			// Furnace/Smoker UI check (active interaction)
 			if (t % 2 == 0) {
 				server.getPlayerManager().getPlayerList().forEach(p -> {
 					if (p.currentScreenHandler instanceof FurnaceScreenHandler ||
@@ -251,8 +270,26 @@ public class Swrpglevels implements ModInitializer {
 						if (!p.currentScreenHandler.slots.isEmpty() && p.currentScreenHandler.getSlot(o) != null) {
 							ItemStack cur = p.currentScreenHandler.getSlot(o).getStack();
 							ItemStack last = lastCookingResult.get(p.getUuid());
-							if (last != null && cur.getItem() == last.getItem() && last.getCount() > cur.getCount())
-								awardSkillXP(p, "cooking", 5 * (last.getCount() - cur.getCount()));
+							if (last != null && !last.isEmpty()) {
+								String lastItemId = Registries.ITEM.getId(last.getItem()).toString();
+								// Check for cooking items.
+								if (config.cookingItems != null && config.cookingItems.containsKey(lastItemId)) {
+									int multiplier = config.cookingItems.get(lastItemId);
+									int curCount = cur.isEmpty() ? 0 : cur.getCount();
+									if (last.getCount() > curCount) {
+										int delta = last.getCount() - curCount;
+										awardSkillXP(p, "cooking", multiplier * delta);
+									}
+									// Check for smithing items.
+								} else if (config.smithingItems != null && config.smithingItems.containsKey(lastItemId)) {
+									int multiplier = config.smithingItems.get(lastItemId);
+									int curCount = cur.isEmpty() ? 0 : cur.getCount();
+									if (last.getCount() > curCount) {
+										int delta = last.getCount() - curCount;
+										awardSkillXP(p, "smithing", multiplier * delta);
+									}
+								}
+							}
 							lastCookingResult.put(p.getUuid(), cur.copy());
 						}
 					} else {
@@ -260,17 +297,19 @@ public class Swrpglevels implements ModInitializer {
 					}
 				});
 			}
+
+			// Campfire check for cooked fish (cod and salmon)
 			if (t % 20 == 0) {
 				server.getPlayerManager().getPlayerList().forEach(p -> {
 					if (!(p.currentScreenHandler instanceof FurnaceScreenHandler || p.currentScreenHandler instanceof SmokerScreenHandler)) {
-						Map<Item,Integer> cur = new HashMap<>();
+						Map<Item, Integer> cur = new HashMap<>();
 						for (int i = 0; i < p.getInventory().size(); i++) {
 							ItemStack s = p.getInventory().getStack(i);
 							if (s.getItem() == Items.COOKED_COD || s.getItem() == Items.COOKED_SALMON)
 								cur.merge(s.getItem(), s.getCount(), Integer::sum);
 						}
 						if (isNearCampfire(p)) {
-							Map<Item,Integer> prev = lastCampfireCookedFishCounts.get(p.getUuid());
+							Map<Item, Integer> prev = lastCampfireCookedFishCounts.get(p.getUuid());
 							if (prev != null)
 								cur.forEach((i, cnt) -> {
 									int d = cnt - prev.getOrDefault(i, 0);
@@ -284,17 +323,64 @@ public class Swrpglevels implements ModInitializer {
 					}
 				});
 			}
+
+			// Inventory-based furnace/smoker check using max count method (split for cooking and smithing)
+			if (t % 20 == 0) {
+				server.getPlayerManager().getPlayerList().forEach(p -> {
+					if (!(p.currentScreenHandler instanceof FurnaceScreenHandler || p.currentScreenHandler instanceof SmokerScreenHandler)) {
+						if (!isNearCampfire(p)) {
+							// Build separate maps for cooking and smithing items from inventory.
+							Map<Item, Integer> currentCooking = new HashMap<>();
+							Map<Item, Integer> currentSmithing = new HashMap<>();
+							for (int i = 0; i < p.getInventory().size(); i++) {
+								ItemStack s = p.getInventory().getStack(i);
+								String itemId = Registries.ITEM.getId(s.getItem()).toString();
+								if (config.cookingItems != null && config.cookingItems.containsKey(itemId))
+									currentCooking.merge(s.getItem(), s.getCount(), Integer::sum);
+								if (config.smithingItems != null && config.smithingItems.containsKey(itemId))
+									currentSmithing.merge(s.getItem(), s.getCount(), Integer::sum);
+							}
+							// Process cooking items.
+							Map<Item, Integer> maxCooking = maxFurnaceCookedFoodCounts.computeIfAbsent(p.getUuid(), k -> new HashMap<>());
+							currentCooking.forEach((item, cnt) -> {
+								int baseline = maxCooking.getOrDefault(item, 0);
+								if (cnt > baseline) {
+									int delta = cnt - baseline;
+									String itemId = Registries.ITEM.getId(item).toString();
+									int multiplier = config.cookingItems.get(itemId);
+									awardSkillXP(p, "cooking", multiplier * delta);
+									maxCooking.put(item, cnt);
+								}
+							});
+							// Process smithing items.
+							Map<Item, Integer> maxSmithing = maxFurnaceSmithingFoodCounts.computeIfAbsent(p.getUuid(), k -> new HashMap<>());
+							currentSmithing.forEach((item, cnt) -> {
+								int baseline = maxSmithing.getOrDefault(item, 0);
+								if (cnt > baseline) {
+									int delta = cnt - baseline;
+									String itemId = Registries.ITEM.getId(item).toString();
+									int multiplier = config.smithingItems.get(itemId);
+									awardSkillXP(p, "smithing", multiplier * delta);
+									maxSmithing.put(item, cnt);
+								}
+							});
+						}
+					}
+				});
+			}
+
+			// Fishing XP check
 			if (t % 2 == 0) {
 				server.getPlayerManager().getPlayerList().forEach(p -> {
 					if (p.getMainHandStack().getItem().equals(Items.FISHING_ROD) ||
 							p.getOffHandStack().getItem().equals(Items.FISHING_ROD)) {
-						Map<Item,Integer> cur = new HashMap<>();
+						Map<Item, Integer> cur = new HashMap<>();
 						for (int i = 0; i < p.getInventory().size(); i++) {
 							ItemStack s = p.getInventory().getStack(i);
 							if (isFishItem(s.getItem()))
 								cur.merge(s.getItem(), s.getCount(), Integer::sum);
 						}
-						Map<Item,Integer> prev = lastFishCounts.get(p.getUuid());
+						Map<Item, Integer> prev = lastFishCounts.get(p.getUuid());
 						if (prev != null)
 							cur.forEach((i, cnt) -> {
 								int d = cnt - prev.getOrDefault(i, 0);
@@ -308,8 +394,8 @@ public class Swrpglevels implements ModInitializer {
 		});
 	}
 
-	private Map<Item,Integer> getInvCounts(ServerPlayerEntity p) {
-		Map<Item,Integer> m = new HashMap<>();
+	private Map<Item, Integer> getInvCounts(ServerPlayerEntity p) {
+		Map<Item, Integer> m = new HashMap<>();
 		for (int i = 0; i < p.getInventory().size(); i++) {
 			ItemStack s = p.getInventory().getStack(i);
 			m.merge(s.getItem(), s.getCount(), Integer::sum);
@@ -352,10 +438,10 @@ public class Swrpglevels implements ModInitializer {
 	private static int getCropAge(BlockState s, CropBlock c) {
 		try {
 			return s.get(CropBlock.AGE);
-		} catch(Exception e) {
+		} catch (Exception e) {
 			try {
 				return s.get(Properties.AGE_7);
-			} catch(Exception ex) {
+			} catch (Exception ex) {
 				LOGGER.error("Crop age error, defaulting to 7", ex);
 				return 7;
 			}
@@ -365,12 +451,12 @@ public class Swrpglevels implements ModInitializer {
 	private static int getMaxAgeForCrop(CropBlock c) {
 		try {
 			return c.getMaxAge();
-		} catch(Exception e) {
+		} catch (Exception e) {
 			try {
 				Method m = CropBlock.class.getDeclaredMethod("getMaxAge");
 				m.setAccessible(true);
-				return (Integer)m.invoke(c);
-			} catch(Exception ex) {
+				return (Integer) m.invoke(c);
+			} catch (Exception ex) {
 				LOGGER.error("Max age error", ex);
 				return 7;
 			}
@@ -394,11 +480,18 @@ public class Swrpglevels implements ModInitializer {
 		return i == Items.COD || i == Items.SALMON || i == Items.TROPICAL_FISH || i == Items.PUFFERFISH;
 	}
 
+	private static boolean isFurnaceCookedFood(Item i) {
+		return i == Items.COOKED_BEEF || i == Items.COOKED_PORKCHOP ||
+				i == Items.COOKED_CHICKEN || i == Items.COOKED_MUTTON ||
+				i == Items.COOKED_RABBIT || i == Items.COOKED_COD ||
+				i == Items.COOKED_SALMON;
+	}
+
 	private static PlayerStats getStatsForPlayer(UUID id) {
 		return playerStatsMap.computeIfAbsent(id, pid -> {
 			try {
 				return loadPlayerStats(pid);
-			} catch(Exception e) {
+			} catch (Exception e) {
 				LOGGER.error("Load error for player {}", pid, e);
 				return new PlayerStats();
 			}
@@ -408,7 +501,7 @@ public class Swrpglevels implements ModInitializer {
 	private static void savePlayerStats(UUID id, PlayerStats s) throws IOException {
 		Path f = CONFIG_DIR.resolve(id.toString() + ".json");
 		Files.createDirectories(CONFIG_DIR);
-		try(Writer w = Files.newBufferedWriter(f)) {
+		try (Writer w = Files.newBufferedWriter(f)) {
 			GSON.toJson(s, w);
 		}
 	}
@@ -416,7 +509,7 @@ public class Swrpglevels implements ModInitializer {
 	private static PlayerStats loadPlayerStats(UUID id) throws IOException {
 		Path f = CONFIG_DIR.resolve(id.toString() + ".json");
 		if (Files.exists(f)) {
-			try(Reader r = Files.newBufferedReader(f)) {
+			try (Reader r = Files.newBufferedReader(f)) {
 				return GSON.fromJson(r, PlayerStats.class);
 			}
 		}
@@ -427,7 +520,7 @@ public class Swrpglevels implements ModInitializer {
 		try {
 			Files.createDirectories(CONFIG_DIR);
 			if (Files.exists(CONFIG_FILE)) {
-				try(Reader r = Files.newBufferedReader(CONFIG_FILE)) {
+				try (Reader r = Files.newBufferedReader(CONFIG_FILE)) {
 					config = GSON.fromJson(r, SkillConfig.class);
 				}
 				if (config.miningBlocks == null)
@@ -437,7 +530,7 @@ public class Swrpglevels implements ModInitializer {
 				saveConfig();
 			}
 			LOGGER.info("Config loaded: {}", GSON.toJson(config));
-		} catch(IOException e) {
+		} catch (IOException e) {
 			LOGGER.error("Config load error", e);
 			config = getDefaultConfig();
 		}
@@ -446,19 +539,24 @@ public class Swrpglevels implements ModInitializer {
 	private static void saveConfig(){
 		try {
 			Files.createDirectories(CONFIG_DIR);
-			try(Writer w = Files.newBufferedWriter(CONFIG_FILE)) {
+			try (Writer w = Files.newBufferedWriter(CONFIG_FILE)) {
 				GSON.toJson(config, w);
 			}
-		} catch(IOException e) {
+		} catch (IOException e) {
 			LOGGER.error("Config save error", e);
 		}
 	}
 
 	private static SkillConfig getDefaultConfig(){
 		SkillConfig d = new SkillConfig();
-		d.agilityBaseXP = d.woodcuttingBaseXP = d.farmingBaseXP = d.harvestingBaseXP = d.fishingBaseXP = d.craftingBaseXP = d.miningBaseXP = d.cookingBaseXP = 100;
-		d.agilityExpandable = d.woodcuttingExpandable = d.farmingExpandable = d.harvestingExpandable = d.fishingExpandable = d.craftingExpandable = d.miningExpandable = d.cookingExpandable = true;
-		d.agilityVanillaXP = d.woodcuttingVanillaXP = d.farmingVanillaXP = d.harvestingVanillaXP = d.fishingVanillaXP = d.craftingVanillaXP = d.miningVanillaXP = d.cookingVanillaXP = 5;
+		d.agilityBaseXP = d.woodcuttingBaseXP = d.farmingBaseXP = d.harvestingBaseXP =
+				d.fishingBaseXP = d.craftingBaseXP = d.miningBaseXP = d.cookingBaseXP = d.smithingBaseXP = 100;
+		d.agilityExpandable = d.woodcuttingExpandable = d.farmingExpandable =
+				d.harvestingExpandable = d.fishingExpandable = d.craftingExpandable = d.miningExpandable =
+						d.cookingExpandable = d.smithingExpandable = true;
+		d.agilityVanillaXP = d.woodcuttingVanillaXP = d.farmingVanillaXP =
+				d.harvestingVanillaXP = d.fishingVanillaXP = d.craftingVanillaXP = d.miningVanillaXP =
+						d.cookingVanillaXP = d.smithingVanillaXP = 5;
 		d.farmingSeeds = Map.ofEntries(
 				Map.entry("minecraft:wheat_seeds", 5),
 				Map.entry("minecraft:beetroot_seeds", 5),
@@ -525,18 +623,40 @@ public class Swrpglevels implements ModInitializer {
 				Map.entry("minecraft:crafting_table", 5),
 				Map.entry("minecraft:anvil", 35)
 		);
+		// Default cooking items for furnace/smoker XP.
+		d.cookingItems = Map.ofEntries(
+				Map.entry("minecraft:cooked_beef", 5),
+				Map.entry("minecraft:cooked_porkchop", 5),
+				Map.entry("minecraft:cooked_chicken", 5),
+				Map.entry("minecraft:cooked_mutton", 5),
+				Map.entry("minecraft:cooked_rabbit", 5),
+				Map.entry("minecraft:cooked_cod", 5),
+				Map.entry("minecraft:cooked_salmon", 5)
+		);
+		// Default smithing items (smelted bars) for furnace/smoker XP.
+		d.smithingItems = Map.ofEntries(
+				Map.entry("minecraft:iron_ingot", 10),
+				Map.entry("minecraft:gold_ingot", 15),
+				Map.entry("minecraft:copper_ingot", 8)
+		);
 		return d;
 	}
 
 	public static class SkillConfig {
-		public int agilityBaseXP, woodcuttingBaseXP, farmingBaseXP, harvestingBaseXP, fishingBaseXP, craftingBaseXP, miningBaseXP, cookingBaseXP;
-		public boolean agilityExpandable, woodcuttingExpandable, farmingExpandable, harvestingExpandable, fishingExpandable, craftingExpandable, miningExpandable, cookingExpandable;
-		public int agilityVanillaXP, woodcuttingVanillaXP, farmingVanillaXP, harvestingVanillaXP, fishingVanillaXP, craftingVanillaXP, miningVanillaXP, cookingVanillaXP;
+		public int agilityBaseXP, woodcuttingBaseXP, farmingBaseXP, harvestingBaseXP,
+				fishingBaseXP, craftingBaseXP, miningBaseXP, cookingBaseXP, smithingBaseXP;
+		public boolean agilityExpandable, woodcuttingExpandable, farmingExpandable,
+				harvestingExpandable, fishingExpandable, craftingExpandable, miningExpandable, cookingExpandable, smithingExpandable;
+		public int agilityVanillaXP, woodcuttingVanillaXP, farmingVanillaXP, harvestingVanillaXP,
+				fishingVanillaXP, craftingVanillaXP, miningVanillaXP, cookingVanillaXP, smithingVanillaXP;
 		public Map<String, Integer> farmingSeeds, harvestingCrops, miningBlocks, woodcuttingBlocks, craftingItems;
+		public Map<String, Integer> cookingItems;
+		// New: Map for smelted bars that award smithing XP.
+		public Map<String, Integer> smithingItems;
 	}
 
 	public static class PlayerStats {
-		private int agilityExp, woodcutExp, farmingExp, harvestingExp, fishingExp, craftingExp, miningExp, cookingExp;
+		private int agilityExp, woodcutExp, farmingExp, harvestingExp, fishingExp, craftingExp, miningExp, cookingExp, smithingExp;
 		public int getAgilityExp() { return agilityExp; }
 		public void addAgilityExp(int a) { agilityExp += a; }
 		public int getWoodcutExp() { return woodcutExp; }
@@ -553,5 +673,7 @@ public class Swrpglevels implements ModInitializer {
 		public void addMiningExp(int a) { miningExp += a; }
 		public int getCookingExp() { return cookingExp; }
 		public void addCookingExp(int a) { cookingExp += a; }
+		public int getSmithingExp() { return smithingExp; }
+		public void addSmithingExp(int a) { smithingExp += a; }
 	}
 }
