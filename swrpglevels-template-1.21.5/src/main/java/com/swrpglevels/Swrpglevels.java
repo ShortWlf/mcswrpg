@@ -17,7 +17,9 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.AnvilScreenHandler;
+import net.minecraft.screen.BrewingStandScreenHandler; // For alchemy
 import net.minecraft.screen.CraftingScreenHandler;
+import net.minecraft.screen.EnchantmentScreenHandler; // For enchanting
 import net.minecraft.screen.FurnaceScreenHandler;
 import net.minecraft.screen.PlayerScreenHandler;
 import net.minecraft.screen.SmokerScreenHandler;
@@ -48,6 +50,7 @@ public class Swrpglevels implements ModInitializer {
 	private static final Path CONFIG_DIR = Path.of("config", MOD_ID), CONFIG_FILE = CONFIG_DIR.resolve("skill_config.json");
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 	private static SkillConfig config;
+
 	private static final Map<UUID, Map<Item, Integer>> prevCraftingInvCounts = new HashMap<>();
 	private static final Map<UUID, ItemStack> lastCookingResult = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> lastFishCounts = new HashMap<>();
@@ -55,6 +58,10 @@ public class Swrpglevels implements ModInitializer {
 	// For inventory-based checks using maximum-count tracking:
 	private static final Map<UUID, Map<Item, Integer>> maxFurnaceCookedFoodCounts = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> maxFurnaceSmithingFoodCounts = new HashMap<>();
+	// For tracking brewing stand outputs for Alchemy XP.
+	private static final Map<UUID, Map<Integer, ItemStack>> lastBrewingStandResults = new HashMap<>();
+	// For tracking changes in the Enchantment screen (slot 0) for Enchanting XP.
+	private static final Map<UUID, ItemStack> lastEnchantmentItem = new HashMap<>();
 
 	// Functional interface for updating XP
 	private interface XPUpdater {
@@ -65,7 +72,7 @@ public class Swrpglevels implements ModInitializer {
 		int vanillaXP();
 	}
 
-	// Map skill strings to updater implementations.
+	// Map skill string names to updater implementations.
 	private static final Map<String, XPUpdater> XP_UPDATERS = new HashMap<>();
 	static {
 		XP_UPDATERS.put("agility", new XPUpdater() {
@@ -124,7 +131,7 @@ public class Swrpglevels implements ModInitializer {
 			public boolean expandable(){ return config.cookingExpandable; }
 			public int vanillaXP(){ return config.cookingVanillaXP; }
 		});
-		// New: XP updater for smithing.
+		// XP updater for smithing.
 		XP_UPDATERS.put("smithing", new XPUpdater() {
 			public int getExp(PlayerStats s){ return s.getSmithingExp(); }
 			public void addExp(PlayerStats s, int xp){ s.addSmithingExp(xp); }
@@ -132,9 +139,25 @@ public class Swrpglevels implements ModInitializer {
 			public boolean expandable(){ return config.smithingExpandable; }
 			public int vanillaXP(){ return config.smithingVanillaXP; }
 		});
+		// XP updater for alchemy.
+		XP_UPDATERS.put("alchemy", new XPUpdater() {
+			public int getExp(PlayerStats s){ return s.getAlchemyExp(); }
+			public void addExp(PlayerStats s, int xp){ s.addAlchemyExp(xp); }
+			public int baseXP(){ return config.alchemyBaseXP; }
+			public boolean expandable(){ return config.alchemyExpandable; }
+			public int vanillaXP(){ return config.alchemyVanillaXP; }
+		});
+		// XP updater for enchanting.
+		XP_UPDATERS.put("enchanting", new XPUpdater() {
+			public int getExp(PlayerStats s){ return s.getEnchantingExp(); }
+			public void addExp(PlayerStats s, int xp){ s.addEnchantingExp(xp); }
+			public int baseXP(){ return config.enchantingBaseXP; }
+			public boolean expandable(){ return config.enchantingExpandable; }
+			public int vanillaXP(){ return config.enchantingVanillaXP; }
+		});
 	}
 
-	// Standard leveling formula
+	// Standard leveling formula.
 	private static int getLevelForSkill(int xp, int baseXP, boolean expandable) {
 		return expandable ? (int)Math.floor((Math.sqrt(8.0 * xp / baseXP + 1) - 1) / 2) : xp / baseXP;
 	}
@@ -188,13 +211,16 @@ public class Swrpglevels implements ModInitializer {
 			lastCampfireCookedFishCounts.remove(id);
 			maxFurnaceCookedFoodCounts.remove(id);
 			maxFurnaceSmithingFoodCounts.remove(id);
+			lastBrewingStandResults.remove(id);
+			lastEnchantmentItem.remove(id);
 		});
 	}
 
 	private void registerCommands() {
+		// Command now uses "/stats" to display skill statistics.
 		CommandRegistrationCallback.EVENT.register((dispatcher, dedicated) ->
 				dispatcher.register(
-						net.minecraft.server.command.CommandManager.literal("swrpgstats")
+						net.minecraft.server.command.CommandManager.literal("stats")
 								.executes(ctx -> {
 									ServerPlayerEntity p = ctx.getSource().getPlayer();
 									p.sendMessage(getStatsMessage(getStatsForPlayer(p.getUuid())), false);
@@ -226,7 +252,9 @@ public class Swrpglevels implements ModInitializer {
 						"§6Crafting: §a" + s.getCraftingExp() + " §6(Level: §a" + getLevelForSkill(s.getCraftingExp(), config.craftingBaseXP, config.craftingExpandable) + "§6)\n" +
 						"§6Cooking: §a" + s.getCookingExp() + " §6(Level: §a" + getLevelForSkill(s.getCookingExp(), config.cookingBaseXP, config.cookingExpandable) + "§6)\n" +
 						"§6Smithing: §a" + s.getSmithingExp() + " §6(Level: §a" + getLevelForSkill(s.getSmithingExp(), config.smithingBaseXP, config.smithingExpandable) + "§6)\n" +
-						"§6Mining: §a" + s.getMiningExp() + " §6(Level: §a" + getLevelForSkill(s.getMiningExp(), config.miningBaseXP, config.miningExpandable) + "§6)"
+						"§6Mining: §a" + s.getMiningExp() + " §6(Level: §a" + getLevelForSkill(s.getMiningExp(), config.miningBaseXP, config.miningExpandable) + "§6)\n" +
+						"§6Alchemy: §a" + s.getAlchemyExp() + " §6(Level: §a" + getLevelForSkill(s.getAlchemyExp(), config.alchemyBaseXP, config.alchemyExpandable) + "§6)\n" +
+						"§6Enchanting: §a" + s.getEnchantingExp() + " §6(Level: §a" + getLevelForSkill(s.getEnchantingExp(), config.enchantingBaseXP, config.enchantingExpandable) + "§6)"
 		);
 	}
 
@@ -391,6 +419,62 @@ public class Swrpglevels implements ModInitializer {
 					}
 				});
 			}
+
+			// Brewing Stand (Alchemy) UI check (active interaction)
+			if (t % 2 == 0) {
+				server.getPlayerManager().getPlayerList().forEach(p -> {
+					if (p.currentScreenHandler instanceof BrewingStandScreenHandler) {
+						Map<Integer, ItemStack> lastMap = lastBrewingStandResults.computeIfAbsent(p.getUuid(), k -> new HashMap<>());
+						// Assume output slots are at indices 1, 2, and 3.
+						for (int slotIndex = 1; slotIndex <= 3; slotIndex++) {
+							if (p.currentScreenHandler.getSlot(slotIndex) != null) {
+								ItemStack curStack = p.currentScreenHandler.getSlot(slotIndex).getStack();
+								ItemStack lastStack = lastMap.get(slotIndex);
+								if (lastStack != null && !lastStack.isEmpty()) {
+									int lastCount = lastStack.getCount();
+									int curCount = curStack.isEmpty() ? 0 : curStack.getCount();
+									if (lastCount > curCount) { // Player removed brewed potions
+										int delta = lastCount - curCount;
+										String itemId = Registries.ITEM.getId(lastStack.getItem()).toString();
+										if (config.alchemyItems != null && config.alchemyItems.containsKey(itemId)) {
+											int multiplier = config.alchemyItems.get(itemId);
+											awardSkillXP(p, "alchemy", multiplier * delta);
+										}
+									}
+								}
+								// Store the current state for comparison next tick
+								lastMap.put(slotIndex, curStack.copy());
+							}
+						}
+					} else {
+						lastBrewingStandResults.remove(p.getUuid());
+					}
+				});
+			}
+
+			// Enchanting XP check
+			if (t % 2 == 0) {
+				server.getPlayerManager().getPlayerList().forEach(p -> {
+					if (p.currentScreenHandler instanceof EnchantmentScreenHandler) {
+						if (p.currentScreenHandler.getSlot(0) != null) {
+							ItemStack current = p.currentScreenHandler.getSlot(0).getStack();
+							ItemStack last = lastEnchantmentItem.get(p.getUuid());
+							if (last != null && !last.isEmpty() && !current.isEmpty()) {
+								boolean lastEnchanted = last.hasEnchantments();
+								boolean currentEnchanted = current.hasEnchantments();
+								// If the item in slot 0 becomes enchanted (or its enchantments change)
+								if ((!lastEnchanted && currentEnchanted) ||
+										(lastEnchanted && currentEnchanted && !last.getEnchantments().equals(current.getEnchantments()))) {
+									awardSkillXP(p, "enchanting", config.enchantingXP);
+								}
+							}
+							lastEnchantmentItem.put(p.getUuid(), current.copy());
+						}
+					} else {
+						lastEnchantmentItem.remove(p.getUuid());
+					}
+				});
+			}
 		});
 	}
 
@@ -480,13 +564,6 @@ public class Swrpglevels implements ModInitializer {
 		return i == Items.COD || i == Items.SALMON || i == Items.TROPICAL_FISH || i == Items.PUFFERFISH;
 	}
 
-	private static boolean isFurnaceCookedFood(Item i) {
-		return i == Items.COOKED_BEEF || i == Items.COOKED_PORKCHOP ||
-				i == Items.COOKED_CHICKEN || i == Items.COOKED_MUTTON ||
-				i == Items.COOKED_RABBIT || i == Items.COOKED_COD ||
-				i == Items.COOKED_SALMON;
-	}
-
 	private static PlayerStats getStatsForPlayer(UUID id) {
 		return playerStatsMap.computeIfAbsent(id, pid -> {
 			try {
@@ -550,13 +627,13 @@ public class Swrpglevels implements ModInitializer {
 	private static SkillConfig getDefaultConfig(){
 		SkillConfig d = new SkillConfig();
 		d.agilityBaseXP = d.woodcuttingBaseXP = d.farmingBaseXP = d.harvestingBaseXP =
-				d.fishingBaseXP = d.craftingBaseXP = d.miningBaseXP = d.cookingBaseXP = d.smithingBaseXP = 100;
+				d.fishingBaseXP = d.craftingBaseXP = d.miningBaseXP = d.cookingBaseXP = d.smithingBaseXP = d.alchemyBaseXP = d.enchantingBaseXP = 100;
 		d.agilityExpandable = d.woodcuttingExpandable = d.farmingExpandable =
 				d.harvestingExpandable = d.fishingExpandable = d.craftingExpandable = d.miningExpandable =
-						d.cookingExpandable = d.smithingExpandable = true;
+						d.cookingExpandable = d.smithingExpandable = d.alchemyExpandable = d.enchantingExpandable = true;
 		d.agilityVanillaXP = d.woodcuttingVanillaXP = d.farmingVanillaXP =
 				d.harvestingVanillaXP = d.fishingVanillaXP = d.craftingVanillaXP = d.miningVanillaXP =
-						d.cookingVanillaXP = d.smithingVanillaXP = 5;
+						d.cookingVanillaXP = d.smithingVanillaXP = d.alchemyVanillaXP = d.enchantingVanillaXP = 5;
 		d.farmingSeeds = Map.ofEntries(
 				Map.entry("minecraft:wheat_seeds", 5),
 				Map.entry("minecraft:beetroot_seeds", 5),
@@ -639,24 +716,39 @@ public class Swrpglevels implements ModInitializer {
 				Map.entry("minecraft:gold_ingot", 15),
 				Map.entry("minecraft:copper_ingot", 8)
 		);
+		// Default alchemy config for brewing potions.
+		d.alchemyBaseXP = 100;
+		d.alchemyExpandable = true;
+		d.alchemyVanillaXP = 5;
+		d.alchemyItems = Map.ofEntries(
+				Map.entry("minecraft:potion", 15),
+				Map.entry("minecraft:splash_potion", 10),
+				Map.entry("minecraft:lingering_potion", 20)
+		);
+		// Default enchanting config.
+		d.enchantingBaseXP = 100;
+		d.enchantingExpandable = true;
+		d.enchantingVanillaXP = 5;
+		d.enchantingXP = 50; // XP awarded each time an item is enchanted
 		return d;
 	}
 
 	public static class SkillConfig {
 		public int agilityBaseXP, woodcuttingBaseXP, farmingBaseXP, harvestingBaseXP,
-				fishingBaseXP, craftingBaseXP, miningBaseXP, cookingBaseXP, smithingBaseXP;
+				fishingBaseXP, craftingBaseXP, miningBaseXP, cookingBaseXP, smithingBaseXP, alchemyBaseXP, enchantingBaseXP;
 		public boolean agilityExpandable, woodcuttingExpandable, farmingExpandable,
-				harvestingExpandable, fishingExpandable, craftingExpandable, miningExpandable, cookingExpandable, smithingExpandable;
-		public int agilityVanillaXP, woodcuttingVanillaXP, farmingVanillaXP, harvestingVanillaXP,
-				fishingVanillaXP, craftingVanillaXP, miningVanillaXP, cookingVanillaXP, smithingVanillaXP;
+				harvestingExpandable, fishingExpandable, craftingExpandable, miningExpandable, cookingExpandable, smithingExpandable, alchemyExpandable, enchantingExpandable;
+		public int agilityVanillaXP, woodcuttingVanillaXP, farmingVanillaXP,
+				harvestingVanillaXP, fishingVanillaXP, craftingVanillaXP, miningVanillaXP, cookingVanillaXP, smithingVanillaXP, alchemyVanillaXP, enchantingVanillaXP;
 		public Map<String, Integer> farmingSeeds, harvestingCrops, miningBlocks, woodcuttingBlocks, craftingItems;
 		public Map<String, Integer> cookingItems;
-		// New: Map for smelted bars that award smithing XP.
 		public Map<String, Integer> smithingItems;
+		public Map<String, Integer> alchemyItems;
+		public int enchantingXP; // XP awarded per enchanting action
 	}
 
 	public static class PlayerStats {
-		private int agilityExp, woodcutExp, farmingExp, harvestingExp, fishingExp, craftingExp, miningExp, cookingExp, smithingExp;
+		private int agilityExp, woodcutExp, farmingExp, harvestingExp, fishingExp, craftingExp, miningExp, cookingExp, smithingExp, alchemyExp, enchantingExp;
 		public int getAgilityExp() { return agilityExp; }
 		public void addAgilityExp(int a) { agilityExp += a; }
 		public int getWoodcutExp() { return woodcutExp; }
@@ -675,5 +767,9 @@ public class Swrpglevels implements ModInitializer {
 		public void addCookingExp(int a) { cookingExp += a; }
 		public int getSmithingExp() { return smithingExp; }
 		public void addSmithingExp(int a) { smithingExp += a; }
+		public int getAlchemyExp() { return alchemyExp; }
+		public void addAlchemyExp(int a) { alchemyExp += a; }
+		public int getEnchantingExp() { return enchantingExp; }
+		public void addEnchantingExp(int a) { enchantingExp += a; }
 	}
 }
