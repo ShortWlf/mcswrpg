@@ -649,3 +649,4 @@ public class Swrpglevels implements ModInitializer {
 		public void addCombatExp(int a) { combatExp += a; }
 	}
 }
+		// need to add tracking for animal kills
