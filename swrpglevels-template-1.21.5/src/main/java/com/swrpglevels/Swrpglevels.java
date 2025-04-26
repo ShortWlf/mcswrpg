@@ -2,6 +2,7 @@ package com.swrpglevels;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonParser;
 import com.google.gson.reflect.TypeToken;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v1.CommandRegistrationCallback;
@@ -15,11 +16,14 @@ import net.minecraft.block.BlockState;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.mob.Monster;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.AxeItem;
+import net.minecraft.item.FishingRodItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.util.hit.HitResult;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.registry.Registries;
-import net.minecraft.screen.AnvilScreenHandler;
 import net.minecraft.screen.BrewingStandScreenHandler;
 import net.minecraft.screen.CraftingScreenHandler;
 import net.minecraft.screen.EnchantmentScreenHandler;
@@ -30,10 +34,10 @@ import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.state.property.Properties;
 import net.minecraft.text.Text;
-import net.minecraft.text.Style;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Formatting;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import org.slf4j.Logger;
@@ -58,14 +62,22 @@ import java.util.ArrayList;
 public class Swrpglevels implements ModInitializer {
 	public static final String MOD_ID = "swrpglevels";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-	private static final Map<UUID, PlayerStats> playerStatsMap = new HashMap<>();
-	private static final Path CONFIG_DIR = Path.of("config", MOD_ID), CONFIG_FILE = CONFIG_DIR.resolve("skill_config.json");
+
+	// Config directory and file
+	private static final Path CONFIG_DIR = Path.of("config", MOD_ID);
+	private static final Path CONFIG_FILE = CONFIG_DIR.resolve("skill_config.json");
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
 	private static SkillConfig config;
 
-	// Existing maps for other XP tracking…
+	// In‑memory player stats, loaded per UUID.
+	private static final Map<UUID, PlayerStats> playerStatsMap = new HashMap<>();
+
+	// Maps for temporary data tracking.
 	private static final Map<UUID, Map<Item, Integer>> prevCraftingInvCounts = new HashMap<>();
 	private static final Map<UUID, ItemStack> lastCookingResult = new HashMap<>();
+	// New map for tracking crafting results
+	private static final Map<UUID, ItemStack> lastCraftingResult = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> lastFishCounts = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> lastCampfireCookedFishCounts = new HashMap<>();
 	private static final Map<UUID, Map<Item, Integer>> maxFurnaceCookedFoodCounts = new HashMap<>();
@@ -73,8 +85,10 @@ public class Swrpglevels implements ModInitializer {
 	private static final Map<UUID, Map<Integer, ItemStack>> lastBrewingStandResults = new HashMap<>();
 	private static final Map<UUID, ItemStack> lastEnchantmentItem = new HashMap<>();
 
-	// NEW: Map to track nearby hostile mobs for each player.
-	// Key: player UUID, Value: Map with key = mob UUID, value = mob type (as a lowercase String)
+	// NEW: For fishing—track the last tick XP was awarded
+	private static final Map<UUID, Long> lastFishingXpTime = new HashMap<>();
+
+	// NEW: Map to track nearby hostile mobs for combat tracking.
 	private static final Map<UUID, Map<UUID, String>> trackedCombatEntities = new HashMap<>();
 
 	// Functional interface for updating XP.
@@ -86,7 +100,7 @@ public class Swrpglevels implements ModInitializer {
 		int vanillaXP();
 	}
 
-	// Map from skill name to XP updater.
+	// Mapping skill names to their XP updater implementations.
 	private static final Map<String, XPUpdater> XP_UPDATERS = new HashMap<>();
 	static {
 		XP_UPDATERS.put("agility", new XPUpdater() {
@@ -166,7 +180,7 @@ public class Swrpglevels implements ModInitializer {
 			public boolean expandable() { return config.enchantingExpandable; }
 			public int vanillaXP() { return config.enchantingVanillaXP; }
 		});
-		// NEW: Combat skill updater.
+		// NEW: Combat updater.
 		XP_UPDATERS.put("combat", new XPUpdater() {
 			public int getExp(PlayerStats s) { return s.getCombatExp(); }
 			public void addExp(PlayerStats s, int xp) { s.addCombatExp(xp); }
@@ -181,7 +195,7 @@ public class Swrpglevels implements ModInitializer {
 		return expandable ? (int) Math.floor((Math.sqrt(8.0 * xp / baseXP + 1) - 1) / 2) : xp / baseXP;
 	}
 
-	// Award XP using our updater mapping.
+	// Award XP via the corresponding updater.
 	private static void awardSkillXP(PlayerEntity player, String skill, int xpAmount) {
 		if (!(player instanceof ServerPlayerEntity sp)) return;
 		XPUpdater updater = XP_UPDATERS.get(skill);
@@ -192,8 +206,10 @@ public class Swrpglevels implements ModInitializer {
 		int newLevel = getLevelForSkill(updater.getExp(stats), updater.baseXP(), updater.expandable());
 		if (newLevel > oldLevel) {
 			sp.addExperience(updater.vanillaXP());
-			sp.getWorld().playSound(null, sp.getBlockPos(), SoundEvents.ENTITY_PLAYER_LEVELUP, sp.getSoundCategory(), 1.0F, 1.0F);
-			sp.sendMessage(Text.literal(skill + " leveled up to " + newLevel + "!").formatted(Formatting.GREEN), true);
+			sp.getWorld().playSound(null, sp.getBlockPos(), SoundEvents.ENTITY_PLAYER_LEVELUP,
+					sp.getSoundCategory(), 1.0F, 1.0F);
+			sp.sendMessage(Text.literal(skill + " leveled up to " + newLevel + "!")
+					.formatted(Formatting.GREEN), true);
 		}
 	}
 
@@ -205,36 +221,49 @@ public class Swrpglevels implements ModInitializer {
 		registerCommands();
 		registerTickEvents();
 		registerUseBlockCallback();
+		registerCampfireUseCallback();
 		registerBlockBreakEvents();
-		// We no longer use a mob death event—we’re using tick‐based scanning from the HF Objectives example.
 		LOGGER.info("Mod initialization complete!");
 	}
 
 	private void registerPlayerEvents() {
 		ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
 			UUID id = handler.player.getUuid();
-			getStatsForPlayer(id);
+			// Create/load player stats.
+			PlayerStats stats = getStatsForPlayer(id);
+			// Immediately write stats to file if missing.
+			Path statsFile = CONFIG_DIR.resolve(id.toString() + ".json");
+			if (!Files.exists(statsFile)) {
+				try {
+					savePlayerStats(id, stats);
+					LOGGER.info("Created new stats file for player: {}", id);
+				} catch (IOException e) {
+					LOGGER.error("Error saving new stats for player {}", id, e);
+				}
+			}
 			prevCraftingInvCounts.put(id, new HashMap<>());
 		});
 		ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
 			UUID id = handler.player.getUuid();
 			PlayerStats s = playerStatsMap.get(id);
-			if (s != null)
+			if (s != null) {
 				try {
 					savePlayerStats(id, s);
 				} catch (IOException e) {
 					LOGGER.error("Error saving stats for player {}", id, e);
 				}
+			}
 			prevCraftingInvCounts.remove(id);
 			lastCookingResult.remove(id);
+			lastCraftingResult.remove(id);
 			lastFishCounts.remove(id);
 			lastCampfireCookedFishCounts.remove(id);
 			maxFurnaceCookedFoodCounts.remove(id);
 			maxFurnaceSmithingFoodCounts.remove(id);
 			lastBrewingStandResults.remove(id);
 			lastEnchantmentItem.remove(id);
-			// Clear tracked combat entities for this player.
 			trackedCombatEntities.remove(id);
+			lastFishingXpTime.remove(id);
 		});
 	}
 
@@ -265,18 +294,30 @@ public class Swrpglevels implements ModInitializer {
 
 	private Text getStatsMessage(PlayerStats s) {
 		return Text.literal(
-				"§6Agility: §a" + s.getAgilityExp() + " §6(Level: §a" + getLevelForSkill(s.getAgilityExp(), config.agilityBaseXP, config.agilityExpandable) + "§6)\n" +
-						"§6Woodcutting: §a" + s.getWoodcutExp() + " §6(Level: §a" + getLevelForSkill(s.getWoodcutExp(), config.woodcuttingBaseXP, config.woodcuttingExpandable) + "§6)\n" +
-						"§6Farming: §a" + s.getFarmingExp() + " §6(Level: §a" + getLevelForSkill(s.getFarmingExp(), config.farmingBaseXP, config.farmingExpandable) + "§6)\n" +
-						"§6Harvesting: §a" + s.getHarvestingExp() + " §6(Level: §a" + getLevelForSkill(s.getHarvestingExp(), config.harvestingBaseXP, config.harvestingExpandable) + "§6)\n" +
-						"§6Fishing: §a" + s.getFishingExp() + " §6(Level: §a" + getLevelForSkill(s.getFishingExp(), config.fishingBaseXP, config.fishingExpandable) + "§6)\n" +
-						"§6Crafting: §a" + s.getCraftingExp() + " §6(Level: §a" + getLevelForSkill(s.getCraftingExp(), config.craftingBaseXP, config.craftingExpandable) + "§6)\n" +
-						"§6Cooking: §a" + s.getCookingExp() + " §6(Level: §a" + getLevelForSkill(s.getCookingExp(), config.cookingBaseXP, config.cookingExpandable) + "§6)\n" +
-						"§6Smithing: §a" + s.getSmithingExp() + " §6(Level: §a" + getLevelForSkill(s.getSmithingExp(), config.smithingBaseXP, config.smithingExpandable) + "§6)\n" +
-						"§6Mining: §a" + s.getMiningExp() + " §6(Level: §a" + getLevelForSkill(s.getMiningExp(), config.miningBaseXP, config.miningExpandable) + "§6)\n" +
-						"§6Alchemy: §a" + s.getAlchemyExp() + " §6(Level: §a" + getLevelForSkill(s.getAlchemyExp(), config.alchemyBaseXP, config.alchemyExpandable) + "§6)\n" +
-						"§6Enchanting: §a" + s.getEnchantingExp() + " §6(Level: §a" + getLevelForSkill(s.getEnchantingExp(), config.enchantingBaseXP, config.enchantingExpandable) + "§6)\n" +
-						"§6Combat: §a" + s.getCombatExp() + " §6(Level: §a" + getLevelForSkill(s.getCombatExp(), config.combatBaseXP, config.combatExpandable) + "§6)"
+				"§6Agility: §a" + s.getAgilityExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getAgilityExp(), config.agilityBaseXP, config.agilityExpandable) + "§6)\n" +
+						"§6Woodcutting: §a" + s.getWoodcutExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getWoodcutExp(), config.woodcuttingBaseXP, config.woodcuttingExpandable) + "§6)\n" +
+						"§6Farming: §a" + s.getFarmingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getFarmingExp(), config.farmingBaseXP, config.farmingExpandable) + "§6)\n" +
+						"§6Harvesting: §a" + s.getHarvestingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getHarvestingExp(), config.harvestingBaseXP, config.harvestingExpandable) + "§6)\n" +
+						"§6Fishing: §a" + s.getFishingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getFishingExp(), config.fishingBaseXP, config.fishingExpandable) + "§6)\n" +
+						"§6Crafting: §a" + s.getCraftingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getCraftingExp(), config.craftingBaseXP, config.craftingExpandable) + "§6)\n" +
+						"§6Cooking: §a" + s.getCookingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getCookingExp(), config.cookingBaseXP, config.cookingExpandable) + "§6)\n" +
+						"§6Smithing: §a" + s.getSmithingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getSmithingExp(), config.smithingBaseXP, config.smithingExpandable) + "§6)\n" +
+						"§6Mining: §a" + s.getMiningExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getMiningExp(), config.miningBaseXP, config.miningExpandable) + "§6)\n" +
+						"§6Alchemy: §a" + s.getAlchemyExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getAlchemyExp(), config.alchemyBaseXP, config.alchemyExpandable) + "§6)\n" +
+						"§6Enchanting: §a" + s.getEnchantingExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getEnchantingExp(), config.enchantingBaseXP, config.enchantingExpandable) + "§6)\n" +
+						"§6Combat: §a" + s.getCombatExp() + " §6(Level: §a" +
+						getLevelForSkill(s.getCombatExp(), config.combatBaseXP, config.combatExpandable) + "§6)"
 		);
 	}
 
@@ -284,27 +325,19 @@ public class Swrpglevels implements ModInitializer {
 		ServerTickEvents.END_SERVER_TICK.register(server -> {
 			int t = server.getTicks();
 
-			// Agility XP (sprinting)
+			// Agility: Award 1 XP every second for sprinting.
 			if (t % 20 == 0) {
 				server.getPlayerManager().getPlayerList().forEach(p -> {
 					if (p.isSprinting())
 						awardSkillXP(p, "agility", 1);
 				});
-			}
 
-			// (Other tick-based skill checks would be here, unchanged.)
-
-			// NEW: Combat kill tracking using tick scanning.
-			// We mimic our HF Objectives "mobkill" tracking.
-			if (t % 20 == 0) { // scan once per second
+				// Combat XP: Tick-based mob scanning (unchanged).
 				server.getPlayerManager().getPlayerList().forEach(player -> {
 					UUID pid = player.getUuid();
-					// Get the previous tracking map for this player (or create one).
 					Map<UUID, String> oldTracking = trackedCombatEntities.computeIfAbsent(pid, k -> new HashMap<>());
-					// Build a new tracking map for mobs currently near the player.
 					Map<UUID, String> newTracking = new HashMap<>();
 					double radius = 20.0D;
-					// Get the server world.
 					var world = (net.minecraft.server.world.ServerWorld) player.getWorld();
 					Box box = new Box(
 							player.getX() - radius, player.getY() - radius, player.getZ() - radius,
@@ -319,8 +352,6 @@ public class Swrpglevels implements ModInitializer {
 							newTracking.put(mob.getUuid(), mobType);
 						}
 					}
-					// For each mob that was previously tracked but is not in the current set,
-					// assume it was killed.
 					for (UUID oldUUID : new ArrayList<>(oldTracking.keySet())) {
 						if (!newTracking.containsKey(oldUUID)) {
 							String mobType = oldTracking.get(oldUUID);
@@ -331,10 +362,124 @@ public class Swrpglevels implements ModInitializer {
 							oldTracking.remove(oldUUID);
 						}
 					}
-					// Update the tracked map for this player.
 					trackedCombatEntities.put(pid, newTracking);
 				});
 			}
+
+			// Cooking/Smithing: Handle furnace and smoker outputs.
+			server.getPlayerManager().getPlayerList().forEach(player -> {
+				if (player instanceof ServerPlayerEntity sp) {
+					if (sp.currentScreenHandler instanceof FurnaceScreenHandler || sp.currentScreenHandler instanceof SmokerScreenHandler) {
+						ItemStack currentResult = ItemStack.EMPTY;
+						if (sp.currentScreenHandler instanceof FurnaceScreenHandler furnaceHandler) {
+							currentResult = furnaceHandler.getSlot(2).getStack();
+						} else if (sp.currentScreenHandler instanceof SmokerScreenHandler smokerHandler) {
+							currentResult = smokerHandler.getSlot(2).getStack();
+						}
+						UUID pid = sp.getUuid();
+						ItemStack lastResult = lastCookingResult.get(pid);
+						if (lastResult != null && !lastResult.isEmpty() && currentResult.isEmpty()) {
+							Identifier itemId = Registries.ITEM.getId(lastResult.getItem());
+							String itemKey = itemId.toString();
+							if (config.cookingItems != null && config.cookingItems.containsKey(itemKey)) {
+								int xpAward = config.cookingItems.get(itemKey);
+								awardSkillXP(sp, "cooking", xpAward);
+								LOGGER.debug("Awarded cooking XP: {} for item: {}", xpAward, itemKey);
+							} else if (config.smithingItems != null && config.smithingItems.containsKey(itemKey)) {
+								int xpAward = config.smithingItems.get(itemKey);
+								awardSkillXP(sp, "smithing", xpAward);
+								LOGGER.debug("Awarded smithing XP: {} for item: {}", xpAward, itemKey);
+							} else {
+								awardSkillXP(sp, "cooking", config.cookingVanillaXP);
+							}
+							lastCookingResult.put(pid, ItemStack.EMPTY);
+						} else if (!currentResult.isEmpty() && (lastResult == null || !currentResult.equals(lastResult))) {
+							lastCookingResult.put(pid, currentResult.copy());
+						}
+					}
+
+					// Crafting: Handle crafting output from table or inventory.
+					if (sp.currentScreenHandler instanceof CraftingScreenHandler || sp.currentScreenHandler instanceof PlayerScreenHandler) {
+						ItemStack currentCraftResult = sp.currentScreenHandler.getSlot(0).getStack();
+						UUID pid = sp.getUuid();
+						ItemStack lastCraftResult = lastCraftingResult.get(pid);
+						if (lastCraftResult != null && !lastCraftResult.isEmpty() && currentCraftResult.isEmpty()) {
+							Identifier itemId = Registries.ITEM.getId(lastCraftResult.getItem());
+							String itemKey = itemId.toString();
+							if (config.craftingItems != null && config.craftingItems.containsKey(itemKey)) {
+								int xpAward = config.craftingItems.get(itemKey);
+								awardSkillXP(sp, "crafting", xpAward);
+								LOGGER.debug("Awarded crafting XP: {} for item: {}", xpAward, itemKey);
+							} else {
+								awardSkillXP(sp, "crafting", config.craftingVanillaXP);
+							}
+							lastCraftingResult.put(pid, ItemStack.EMPTY);
+						} else if (!currentCraftResult.isEmpty() && (lastCraftResult == null || !currentCraftResult.equals(lastCraftResult))) {
+							lastCraftingResult.put(pid, currentCraftResult.copy());
+						}
+					}
+
+					// Alchemy: Handle brewing stand outputs.
+					if (sp.currentScreenHandler instanceof BrewingStandScreenHandler brewHandler) {
+						UUID pid = sp.getUuid();
+						// For simplicity, check slot 0.
+						ItemStack currentBrewResult = brewHandler.getSlot(0).getStack();
+						Map<Integer, ItemStack> lastBrewMap = lastBrewingStandResults.computeIfAbsent(pid, k -> new HashMap<>());
+						ItemStack lastBrewResult = lastBrewMap.getOrDefault(0, ItemStack.EMPTY);
+						if (!lastBrewResult.isEmpty() && currentBrewResult.isEmpty()) {
+							Identifier itemId = Registries.ITEM.getId(lastBrewResult.getItem());
+							String itemKey = itemId.toString();
+							int xpAward = (config.alchemyItems != null && config.alchemyItems.containsKey(itemKey))
+									? config.alchemyItems.get(itemKey)
+									: config.alchemyVanillaXP;
+							awardSkillXP(sp, "alchemy", xpAward);
+							LOGGER.debug("Awarded alchemy XP: {} for brewed item: {}", xpAward, itemKey);
+							lastBrewMap.put(0, ItemStack.EMPTY);
+						} else if (!currentBrewResult.isEmpty() && (lastBrewResult.isEmpty() || !currentBrewResult.equals(lastBrewResult))) {
+							lastBrewMap.put(0, currentBrewResult.copy());
+						}
+					}
+
+					// Enchanting: Handle enchanting table output.
+					if (sp.currentScreenHandler instanceof EnchantmentScreenHandler enchantHandler) {
+						UUID pid = sp.getUuid();
+						ItemStack enchantItem = enchantHandler.getSlot(0).getStack();
+						ItemStack lastEnchItem = lastEnchantmentItem.get(pid);
+						if (lastEnchItem != null && !lastEnchItem.isEmpty() && enchantItem.isEmpty()) {
+							awardSkillXP(sp, "enchanting", config.enchantingXP);
+							LOGGER.debug("Awarded enchanting XP: {} on item finish", config.enchantingXP);
+							lastEnchantmentItem.put(pid, ItemStack.EMPTY);
+						} else if (!enchantItem.isEmpty() && (lastEnchItem == null || !enchantItem.equals(lastEnchItem))) {
+							lastEnchantmentItem.put(pid, enchantItem.copy());
+						}
+					}
+
+					if (sp.getMainHandStack().getItem() instanceof FishingRodItem) {
+						// Cast a ray from the player's eyes out to 20 blocks (including fluids).
+						HitResult rayResult = sp.raycast(20.0, 1.0F, true);
+						if (rayResult.getType() == HitResult.Type.BLOCK) {
+							Vec3d hitPos = rayResult.getPos();
+							// Convert the Vec3d coordinates to integer block coordinates using floor.
+							BlockPos pos = new BlockPos(
+									(int) Math.floor(hitPos.x),
+									(int) Math.floor(hitPos.y),
+									(int) Math.floor(hitPos.z)
+							);
+							// Check if the target block contains fluid.
+							if (!sp.getWorld().getBlockState(pos).getFluidState().isEmpty()) {
+								UUID pid = sp.getUuid();
+								long lastTime = lastFishingXpTime.getOrDefault(pid, 0L);
+								if (t - lastTime >= 20) { // roughly once per second
+									awardSkillXP(sp, "fishing", 1);
+									LOGGER.debug("Awarded fishing XP");
+									lastFishingXpTime.put(pid, (long) t);
+								}
+							}
+						}
+					}
+
+				}
+			});
 		});
 	}
 
@@ -347,35 +492,58 @@ public class Swrpglevels implements ModInitializer {
 		return m;
 	}
 
+	// UseBlockCallback for farming seeds (unchanged).
 	private void registerUseBlockCallback() {
-		UseBlockCallback.EVENT.register((p, w, h, hr) -> {
-			if (!w.isClient()) {
-				String id = Registries.ITEM.getId(p.getStackInHand(h).getItem()).toString();
+		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+			if (!world.isClient()) {
+				String id = Registries.ITEM.getId(player.getStackInHand(hand).getItem()).toString();
 				if (config.farmingSeeds.containsKey(id))
-					awardSkillXP(p, "farming", config.farmingSeeds.get(id));
+					awardSkillXP(player, "farming", config.farmingSeeds.get(id));
+			}
+			return ActionResult.PASS;
+		});
+	}
+
+	// Campfire: Award cooking XP when a player interacts with a lit campfire while holding raw food.
+	private void registerCampfireUseCallback() {
+		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+			if (!world.isClient() && hitResult instanceof BlockHitResult bhr) {
+				BlockPos pos = bhr.getBlockPos();
+				BlockState state = world.getBlockState(pos);
+				if (state.getBlock() instanceof CampfireBlock && state.get(CampfireBlock.LIT)) {
+					String heldItemId = Registries.ITEM.getId(player.getStackInHand(hand).getItem()).toString();
+					// Example: if the held item is raw beef, award XP for cooked beef.
+					if (heldItemId.equals("minecraft:raw_beef")) {
+						int xpAward = (config.cookingItems != null && config.cookingItems.containsKey("minecraft:cooked_beef"))
+								? config.cookingItems.get("minecraft:cooked_beef")
+								: config.cookingVanillaXP;
+						awardSkillXP(player, "cooking", xpAward);
+						LOGGER.debug("Awarded campfire cooking XP for raw beef: {}", xpAward);
+					}
+				}
 			}
 			return ActionResult.PASS;
 		});
 	}
 
 	private void registerBlockBreakEvents() {
-		PlayerBlockBreakEvents.AFTER.register((w, p, pos, s, be) -> {
-			String id = Registries.BLOCK.getId(s.getBlock()).toString();
-			LOGGER.debug("Player {} broke block: {}", p.getUuid(), id);
+		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, be) -> {
+			String id = Registries.BLOCK.getId(state.getBlock()).toString();
+			LOGGER.debug("Player {} broke block: {}", player.getUuid(), id);
 			if (config.woodcuttingBlocks.containsKey(id))
-				awardSkillXP(p, "woodcutting", config.woodcuttingBlocks.get(id));
+				awardSkillXP(player, "woodcutting", config.woodcuttingBlocks.get(id));
 			if (config.harvestingCrops.containsKey(id)) {
 				int xp = config.harvestingCrops.get(id);
-				if (s.getBlock() instanceof CropBlock crop) {
-					int age = getCropAge(s, crop), max = getMaxAgeForCrop(crop);
+				if (state.getBlock() instanceof CropBlock crop) {
+					int age = getCropAge(state, crop), max = getMaxAgeForCrop(crop);
 					if (age == max)
-						awardSkillXP(p, "harvesting", xp);
+						awardSkillXP(player, "harvesting", xp);
 				} else {
-					awardSkillXP(p, "harvesting", xp);
+					awardSkillXP(player, "harvesting", xp);
 				}
 			}
 			if (config.miningBlocks.containsKey(id))
-				awardSkillXP(p, "mining", config.miningBlocks.get(id));
+				awardSkillXP(player, "mining", config.miningBlocks.get(id));
 		});
 	}
 
@@ -407,23 +575,6 @@ public class Swrpglevels implements ModInitializer {
 		}
 	}
 
-	private static boolean isNearCampfire(ServerPlayerEntity p) {
-		BlockPos pos = p.getBlockPos();
-		for (int x = -2; x <= 2; x++)
-			for (int y = -1; y <= 1; y++)
-				for (int z = -2; z <= 2; z++) {
-					BlockPos cp = pos.add(x, y, z);
-					BlockState st = p.getWorld().getBlockState(cp);
-					if (st.getBlock() instanceof CampfireBlock && st.get(CampfireBlock.LIT))
-						return true;
-				}
-		return false;
-	}
-
-	private static boolean isFishItem(Item i) {
-		return i == Items.COD || i == Items.SALMON || i == Items.TROPICAL_FISH || i == Items.PUFFERFISH;
-	}
-
 	private static PlayerStats getStatsForPlayer(UUID id) {
 		return playerStatsMap.computeIfAbsent(id, pid -> {
 			try {
@@ -453,6 +604,7 @@ public class Swrpglevels implements ModInitializer {
 		return new PlayerStats();
 	}
 
+	// Load config with migration logic to fill in missing keys.
 	private static void loadConfig() {
 		try {
 			Files.createDirectories(CONFIG_DIR);
@@ -462,6 +614,12 @@ public class Swrpglevels implements ModInitializer {
 					Type configType = new TypeToken<SkillConfig>() {}.getType();
 					config = GSON.fromJson(r, configType);
 				}
+				// Migration checks.
+				SkillConfig defaultConfig = getDefaultConfig();
+				if (config.smithingItems == null) config.smithingItems = defaultConfig.smithingItems;
+				if (config.alchemyItems == null) config.alchemyItems = defaultConfig.alchemyItems;
+				if (config.craftingItems == null) config.craftingItems = defaultConfig.craftingItems;
+				if (config.enchantingXP == 0) config.enchantingXP = defaultConfig.enchantingXP;
 			} else {
 				config = getDefaultConfig();
 				saveConfig();
@@ -487,18 +645,20 @@ public class Swrpglevels implements ModInitializer {
 	private static SkillConfig getDefaultConfig() {
 		SkillConfig d = new SkillConfig();
 		d.agilityBaseXP = d.woodcuttingBaseXP = d.farmingBaseXP = d.harvestingBaseXP =
-				d.fishingBaseXP = d.craftingBaseXP = d.miningBaseXP = d.cookingBaseXP = d.smithingBaseXP = d.alchemyBaseXP = d.enchantingBaseXP = 100;
+				d.fishingBaseXP = d.craftingBaseXP = d.miningBaseXP = d.cookingBaseXP =
+						d.smithingBaseXP = d.alchemyBaseXP = d.enchantingBaseXP = 100;
 		d.agilityExpandable = d.woodcuttingExpandable = d.farmingExpandable =
-				d.harvestingExpandable = d.fishingExpandable = d.craftingExpandable = d.miningExpandable =
-						d.cookingExpandable = d.smithingExpandable = d.alchemyExpandable = d.enchantingExpandable = true;
+				d.harvestingExpandable = d.fishingExpandable = d.craftingExpandable =
+						d.miningExpandable = d.cookingExpandable = d.smithingExpandable =
+								d.alchemyExpandable = d.enchantingExpandable = true;
 		d.agilityVanillaXP = d.woodcuttingVanillaXP = d.farmingVanillaXP =
-				d.harvestingVanillaXP = d.fishingVanillaXP = d.craftingVanillaXP = d.miningVanillaXP =
-						d.cookingVanillaXP = d.smithingVanillaXP = d.alchemyVanillaXP = d.enchantingVanillaXP = 5;
+				d.harvestingVanillaXP = d.fishingVanillaXP = d.craftingVanillaXP =
+						d.miningVanillaXP = d.cookingVanillaXP = d.smithingVanillaXP =
+								d.alchemyVanillaXP = d.enchantingVanillaXP = 5;
 		// New defaults for combat:
 		d.combatBaseXP = 100;
 		d.combatExpandable = true;
 		d.combatVanillaXP = 5;
-		// NEW: Configurable combat mobs.
 		d.combatMobs = Map.ofEntries(
 				Map.entry("minecraft:zombie", 5),
 				Map.entry("minecraft:creeper", 7),
@@ -619,7 +779,7 @@ public class Swrpglevels implements ModInitializer {
 
 	public static class PlayerStats {
 		private int agilityExp, woodcutExp, farmingExp, harvestingExp, fishingExp, craftingExp, miningExp, cookingExp, smithingExp, alchemyExp, enchantingExp;
-		// NEW: Combat skill field.
+		// NEW: Combat skill.
 		private int combatExp;
 
 		public int getAgilityExp() { return agilityExp; }
@@ -644,9 +804,7 @@ public class Swrpglevels implements ModInitializer {
 		public void addAlchemyExp(int a) { alchemyExp += a; }
 		public int getEnchantingExp() { return enchantingExp; }
 		public void addEnchantingExp(int a) { enchantingExp += a; }
-		// NEW: Combat getters and adders.
 		public int getCombatExp() { return combatExp; }
 		public void addCombatExp(int a) { combatExp += a; }
 	}
 }
-		// need to add tracking for animal kills
