@@ -1,5 +1,7 @@
 package com.swrpgtrees;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -29,7 +31,7 @@ public class Swrpgtrees implements ModInitializer {
 	public static final String MOD_ID = "swrpgtrees";
 	private static final Logger LOGGER = LogManager.getLogger();
 
-	// Sets of valid log and leaf blocks loaded from configuration.
+	// Sets of valid log and leaf blocks loaded from the configuration.
 	private final Set<Block> logBlocks = new HashSet<>();
 	private final Set<Block> leafBlocks = new HashSet<>();
 
@@ -43,9 +45,9 @@ public class Swrpgtrees implements ModInitializer {
 		ensureConfigFile();
 		loadConfig();
 
-		// Register our block-break event.
-		// The tree-felling mechanic triggers only if:
-		//   - The call is server-side.
+		// Register the block-break event.
+		// Tree-felling triggers only if:
+		//   - The world is server-side.
 		//   - The player is sneaking.
 		//   - The player is using an axe in their main hand.
 		//   - The broken block is a registered log that appears to be at the bottom.
@@ -53,18 +55,18 @@ public class Swrpgtrees implements ModInitializer {
 			if (!world.isClient && player.isSneaking()) {
 				// Ensure the player is holding an axe.
 				if (!(player.getMainHandStack().getItem() instanceof AxeItem)) {
-					return; // Not using an axe, so exit.
+					return;
 				}
 				Block block = state.getBlock();
 				if (logBlocks.contains(block)) {
-					// A block is considered the bottom log if it's at Y==0 or the block below isn't a valid log.
+					// A block is considered the bottom log if it's at Y==0
+					// or the block below isn't a valid log.
 					if (pos.getY() == 0 || !logBlocks.contains(world.getBlockState(pos.down()).getBlock())) {
 						if (processingTrees.contains(pos)) {
-							return; // Already processing this tree.
+							return;
 						}
 						processingTrees.add(pos);
 						LOGGER.info("Bottom log at " + pos + " detected while sneaking with an axe. Triggering instant tree fall.");
-						// Cast the world to ServerWorld and trigger the instant tree fall.
 						fallTreeInstantly((ServerWorld) world, pos);
 						processingTrees.remove(pos);
 					}
@@ -91,6 +93,13 @@ public class Swrpgtrees implements ModInitializer {
 				logs.add(new JsonPrimitive("minecraft:jungle_log"));
 				logs.add(new JsonPrimitive("minecraft:acacia_log"));
 				logs.add(new JsonPrimitive("minecraft:dark_oak_log"));
+				// Added new wood types:
+				logs.add(new JsonPrimitive("minecraft:cherry_log"));
+				logs.add(new JsonPrimitive("minecraft:pale_oak_log"));
+				logs.add(new JsonPrimitive("minecraft:mangrove_log"));
+				// Nether wood types:
+				logs.add(new JsonPrimitive("minecraft:crimson_stem"));
+				logs.add(new JsonPrimitive("minecraft:warped_stem"));
 				defaultConfig.add("logs", logs);
 
 				// Default leaf block identifiers.
@@ -101,11 +110,16 @@ public class Swrpgtrees implements ModInitializer {
 				leaves.add(new JsonPrimitive("minecraft:jungle_leaves"));
 				leaves.add(new JsonPrimitive("minecraft:acacia_leaves"));
 				leaves.add(new JsonPrimitive("minecraft:dark_oak_leaves"));
+				// Added new leaf types:
+				leaves.add(new JsonPrimitive("minecraft:cherry_leaves"));
+				leaves.add(new JsonPrimitive("minecraft:pale_oak_leaves"));
+				leaves.add(new JsonPrimitive("minecraft:mangrove_leaves"));
 				defaultConfig.add("leaves", leaves);
 
 				Files.createDirectories(Paths.get("config"));
 				try (FileWriter writer = new FileWriter(configPath)) {
-					writer.write(defaultConfig.toString());
+					Gson gson = new GsonBuilder().setPrettyPrinting().create();
+					writer.write(gson.toJson(defaultConfig));
 				}
 				LOGGER.info("Default config file created successfully.");
 			}
