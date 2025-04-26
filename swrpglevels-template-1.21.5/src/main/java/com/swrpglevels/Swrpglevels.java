@@ -332,33 +332,60 @@ public class Swrpglevels implements ModInitializer {
 						awardSkillXP(p, "agility", 1);
 				});
 
-				// Combat XP: Tick-based mob scanning (unchanged).
+// Combat XP: Tick-based mob scanning with local area checking.
 				server.getPlayerManager().getPlayerList().forEach(player -> {
 					UUID pid = player.getUuid();
 					Map<UUID, String> oldTracking = trackedCombatEntities.computeIfAbsent(pid, k -> new HashMap<>());
 					Map<UUID, String> newTracking = new HashMap<>();
-					double radius = 20.0D;
+					double scanRadius = 20.0D;
 					var world = (net.minecraft.server.world.ServerWorld) player.getWorld();
 					Box box = new Box(
-							player.getX() - radius, player.getY() - radius, player.getZ() - radius,
-							player.getX() + radius, player.getY() + radius, player.getZ() + radius
+							player.getX() - scanRadius, player.getY() - scanRadius, player.getZ() - scanRadius,
+							player.getX() + scanRadius, player.getY() + scanRadius, player.getZ() + scanRadius
 					);
 					List<LivingEntity> nearbyMobs = world.getEntitiesByClass(LivingEntity.class, box,
 							entity -> entity instanceof Monster);
+
+					// Populate newTracking with mob type AND its coordinates encoded as "mobType|x,y,z".
 					for (LivingEntity mob : nearbyMobs) {
 						Identifier mobId = Registries.ENTITY_TYPE.getId(mob.getType());
 						if (mobId != null) {
 							String mobType = mobId.toString().trim().toLowerCase();
-							newTracking.put(mob.getUuid(), mobType);
+							String encoded = mobType + "|" + mob.getX() + "," + mob.getY() + "," + mob.getZ();
+							newTracking.put(mob.getUuid(), encoded);
 						}
 					}
+
+					// Define the awarding radius – only count mobs that were close (within this radius).
+					double awardingRadius = 20.0D; // Adjust this value if needed.
+
+					// Check for mobs from oldTracking that no longer appear in newTracking.
 					for (UUID oldUUID : new ArrayList<>(oldTracking.keySet())) {
 						if (!newTracking.containsKey(oldUUID)) {
-							String mobType = oldTracking.get(oldUUID);
-							int xpAward = (config.combatMobs != null && config.combatMobs.containsKey(mobType))
-									? config.combatMobs.get(mobType)
-									: config.combatVanillaXP;
-							awardSkillXP(player, "combat", xpAward);
+							String encoded = oldTracking.get(oldUUID);
+							// We expect the string to be in the format "mobType|x,y,z"
+							String[] parts = encoded.split("\\|");
+							if (parts.length == 2) {
+								String mobType = parts[0];
+								String[] posParts = parts[1].split(",");
+								if (posParts.length == 3) {
+									try {
+										double lastX = Double.parseDouble(posParts[0]);
+										double lastY = Double.parseDouble(posParts[1]);
+										double lastZ = Double.parseDouble(posParts[2]);
+										// Calculate distance between the player's current location and the mob’s last known position.
+										double distanceSq = player.squaredDistanceTo(lastX, lastY, lastZ);
+										if (distanceSq <= awardingRadius * awardingRadius) {
+											int xpAward = (config.combatMobs != null && config.combatMobs.containsKey(mobType))
+													? config.combatMobs.get(mobType)
+													: config.combatVanillaXP;
+											awardSkillXP(player, "combat", xpAward);
+										}
+									} catch (NumberFormatException e) {
+										LOGGER.error("Error parsing mob position for combat XP: {}", encoded, e);
+									}
+								}
+							}
 							oldTracking.remove(oldUUID);
 						}
 					}
