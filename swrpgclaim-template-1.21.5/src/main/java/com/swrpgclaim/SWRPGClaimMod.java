@@ -216,8 +216,9 @@ public class SWRPGClaimMod implements ModInitializer {
 			);
 
 			// /refreshclaims - Reload configuration from disk.
+			// Only change: Now everyone can use it.
 			dispatcher.register(CommandManager.literal("refreshclaims")
-					.requires(source -> source.hasPermissionLevel(2))
+					.requires(source -> true)
 					.executes(context -> {
 						config = ClaimConfig.load();
 						context.getSource().sendFeedback(() ->
