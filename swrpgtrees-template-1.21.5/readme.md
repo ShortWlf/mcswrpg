@@ -1,0 +1,5 @@
+Swrpgtrees is a Minecraft mod that enables instant tree-felling mechanics when players chop down a tree using an axe while sneaking. The mod detects whether the block being broken is a valid tree log positioned at the bottom of a tree structure. If the conditions are met, Swrpgtrees automatically breaks all connected logs and leaves within a set radius and height, mimicking the effect of fully cutting down the tree in one action.
+
+The mod integrates a configuration file (swrpgtrees.json) that allows server administrators to customize which types of logs and leaves are recognized as valid tree materials. It supports vanilla trees as well as new tree types such as cherry, mangrove, pale oak, and nether stems (crimson and warped).
+
+Additionally, Swrpgtrees prevents redundant tree-processing using a tracking system that marks trees undergoing instant felling to ensure smooth execution. It efficiently scans a bounding box around the bottom log, eliminating all tree materials within the defined region while ensuring dropped items are properly collected.
