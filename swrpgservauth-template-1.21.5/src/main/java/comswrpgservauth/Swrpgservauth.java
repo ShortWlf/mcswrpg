@@ -2,132 +2,323 @@ package comswrpgservauth;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
-import com.google.gson.reflect.TypeToken;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.minecraft.network.ClientConnection;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.network.ServerPlayNetworkHandler;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
-import java.lang.reflect.Type;
+import java.lang.reflect.Field;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Set;
+import java.util.Map;
 
 public class Swrpgservauth implements ModInitializer {
+
 	public static final String MOD_ID = "swrpgservauth";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
+	// Global flag: when true, if a player’s per-user flag is true then IP verification is enforced.
+	private boolean requireIpValidation = true;
+
+	// Path to the configuration file.
 	private static final String CONFIG_FILE = "config/allowed_players.json";
-	private final Set<String> allowedPlayers = new HashSet<>();
-	private static final String DEFAULT_USERNAME = "ShortWlf";
-	private static final List<String> DEFAULT_PLAYERS = List.of(DEFAULT_USERNAME, "ExampleUser1", "AnotherPlayer");
+
+	// Allowed players are stored in a map from username to AllowedPlayer.
+	private final Map<String, AllowedPlayer> allowedPlayers = new HashMap<>();
+
+	// Default users – these are to be added on first run.
+	private static final List<String> DEFAULT_PLAYERS = List.of("ShortWlf", "ExampleUser1", "AnotherPlayer");
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
+	// Class to hold per-user allowed data.
+	public static class AllowedPlayer {
+		public boolean verifyIp = false;  // When true, this player's IP must match one of the allowed IPs.
+		public List<String> ips = new ArrayList<>();
+	}
+
 	@Override
 	public void onInitialize() {
-		LOGGER.info("Initializing Simple Username Auth Mod!");
+		LOGGER.info("Initializing Simple Username Auth Mod with per-user IP verification (using reflection)!");
 		loadConfig();
 
-		// Use the JOIN event to manage connections.
-		// Instead of disconnecting immediately—which may occur before all connection processes finish—
-		// we schedule a task for the next tick to fully disconnect unauthorized players,
-		// then remove them from the player manager.
+		// Register the join event listener.
 		ServerPlayConnectionEvents.JOIN.register((handler, additions, server) -> {
 			ServerPlayerEntity player = handler.getPlayer();
 			String username = player.getName().getString();
-			if (!allowedPlayers.contains(username)) {
+			AllowedPlayer entry = allowedPlayers.get(username);
+			if (entry == null) {
 				LOGGER.warn("Unauthorized player '{}' attempted to join.", username);
 				server.execute(() -> {
-					// Double-check that the player is still present.
 					if (!player.isRemoved()) {
 						player.networkHandler.disconnect(
 								Text.literal("You are not authorized to join this server.").formatted(Formatting.RED)
 						);
-						// Explicitly remove the player from the player manager to try and avoid ghosting.
 						server.getPlayerManager().remove(player);
-						LOGGER.warn("Unauthorized player '{}' has been disconnected and removed.", username);
+						LOGGER.warn("Unauthorized player '{}' has been disconnected.", username);
 					}
 				});
-			} else {
-				LOGGER.info("Player '{}' joined and is authorized.", username);
-				player.sendMessage(Text.literal("Welcome!").formatted(Formatting.GREEN));
+				return;
 			}
+
+			// If global validation is enabled and the user is flagged for IP verification, perform the check.
+			if (requireIpValidation && entry.verifyIp) {
+				if (entry.ips.isEmpty()) {
+					LOGGER.warn("User '{}' is flagged for IP verification but has no allowed IP set.", username);
+					server.execute(() -> {
+						if (!player.isRemoved()) {
+							player.networkHandler.disconnect(
+									Text.literal("No authorized IP set for your account.").formatted(Formatting.RED)
+							);
+							server.getPlayerManager().remove(player);
+							LOGGER.warn("Player '{}' has been disconnected due to lack of an authorized IP.", username);
+						}
+					});
+					return;
+				}
+				SocketAddress socketAddress = getConnectionAddress(handler);
+				final String ipAddress;
+				if (socketAddress instanceof InetSocketAddress) {
+					ipAddress = ((InetSocketAddress) socketAddress).getAddress().getHostAddress();
+				} else {
+					ipAddress = "";
+				}
+				LOGGER.debug("User '{}' is connecting from IP: '{}'", username, ipAddress);
+				if (!entry.ips.contains(ipAddress)) {
+					LOGGER.warn("Unauthorized IP '{}' for user '{}'.", ipAddress, username);
+					server.execute(() -> {
+						if (!player.isRemoved()) {
+							player.networkHandler.disconnect(
+									Text.literal("Your IP address is not authorized for your account.").formatted(Formatting.RED)
+							);
+							server.getPlayerManager().remove(player);
+							LOGGER.warn("Player '{}' with unauthorized IP '{}' has been disconnected.", username, ipAddress);
+						}
+					});
+					return;
+				}
+			}
+			LOGGER.info("Player '{}' joined and is authorized.", username);
+			player.sendMessage(Text.literal("Welcome!").formatted(Formatting.GREEN));
 		});
 
+		// Register commands.
 		CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> registerCommands(dispatcher));
 	}
 
+	/**
+	 * Iterates through the ServerPlayNetworkHandler class hierarchy and returns
+	 * the first ClientConnection's address it finds.
+	 */
+	private SocketAddress getConnectionAddress(ServerPlayNetworkHandler handler) {
+		Class<?> clazz = handler.getClass();
+		while (clazz != null) {
+			for (Field field : clazz.getDeclaredFields()) {
+				if (ClientConnection.class.isAssignableFrom(field.getType())) {
+					field.setAccessible(true);
+					try {
+						ClientConnection connection = (ClientConnection) field.get(handler);
+						if (connection != null) {
+							return connection.getAddress();
+						}
+					} catch (IllegalAccessException e) {
+						LOGGER.error("IllegalAccessException while retrieving connection: ", e);
+					}
+				}
+			}
+			clazz = clazz.getSuperclass();
+		}
+		LOGGER.error("Failed to retrieve connection via reflection for handler: {}", handler.getClass().getName());
+		return null;
+	}
+
+	/**
+	 * Loads the configuration from the JSON file.
+	 *
+	 * The expected JSON format:
+	 * {
+	 *   "requireIpValidation": true,
+	 *   "allowedPlayers": {
+	 *       "ShortWlf": {
+	 *           "verifyIp": true,
+	 *           "ips": ["10.187.1.184"]
+	 *       },
+	 *       "ExampleUser1": {
+	 *           "verifyIp": false,
+	 *           "ips": []
+	 *       },
+	 *       "AnotherPlayer": {
+	 *           "verifyIp": false,
+	 *           "ips": []
+	 *       }
+	 *   }
+	 * }
+	 */
 	public void loadConfig() {
 		File configFile = new File(CONFIG_FILE);
 		if (configFile.exists()) {
 			try (FileReader reader = new FileReader(configFile)) {
-				Type type = new TypeToken<List<String>>() {}.getType();
-				List<String> loadedPlayers = GSON.fromJson(reader, type);
-				if (loadedPlayers != null && !loadedPlayers.isEmpty()) {
-					this.allowedPlayers.addAll(loadedPlayers);
+				JsonObject json = GSON.fromJson(reader, JsonObject.class);
+				requireIpValidation = json.has("requireIpValidation") && json.get("requireIpValidation").getAsBoolean();
+				JsonObject playersObject = json.getAsJsonObject("allowedPlayers");
+				if (playersObject != null && !playersObject.entrySet().isEmpty()) {
+					allowedPlayers.clear();
+					for (Map.Entry<String, JsonElement> entry : playersObject.entrySet()) {
+						AllowedPlayer ap = new AllowedPlayer();
+						JsonObject playerObj = entry.getValue().getAsJsonObject();
+						if (playerObj.has("verifyIp")) {
+							ap.verifyIp = playerObj.get("verifyIp").getAsBoolean();
+						}
+						if (playerObj.has("ips")) {
+							JsonArray arr = playerObj.getAsJsonArray("ips");
+							for (JsonElement el : arr) {
+								ap.ips.add(el.getAsString());
+							}
+						}
+						allowedPlayers.put(entry.getKey(), ap);
+					}
 					LOGGER.info("Loaded allowed player list from '{}'.", CONFIG_FILE);
 				} else {
-					this.allowedPlayers.addAll(DEFAULT_PLAYERS);
-					saveConfig();
-					LOGGER.info("Allowed player list in '{}' was empty, wrote default entries.", CONFIG_FILE);
+					setDefaultConfig();
 				}
 			} catch (IOException e) {
 				LOGGER.error("Error loading allowed player list from '{}': {}", CONFIG_FILE, e.getMessage());
-				this.allowedPlayers.addAll(DEFAULT_PLAYERS);
-				saveConfig();
+				setDefaultConfig();
 			}
 		} else {
-			this.allowedPlayers.addAll(DEFAULT_PLAYERS);
-			saveConfig();
-			LOGGER.info("Created default allowed player list in '{}'.", CONFIG_FILE);
+			setDefaultConfig();
 		}
 	}
 
+	/**
+	 * Creates a default configuration.
+	 * Users are added with their verifyIp flag set to the global flag and an empty IP list.
+	 */
+	private void setDefaultConfig() {
+		requireIpValidation = true;
+		allowedPlayers.clear();
+		for (String user : DEFAULT_PLAYERS) {
+			AllowedPlayer ap = new AllowedPlayer();
+			ap.verifyIp = requireIpValidation;
+			allowedPlayers.put(user, ap);
+		}
+		saveConfig();
+		LOGGER.info("Created default allowed player list in '{}'.", CONFIG_FILE);
+	}
+
+	/**
+	 * Saves the configuration to the JSON file.
+	 */
 	public void saveConfig() {
-		List<String> playersToSave = new ArrayList<>(this.allowedPlayers);
 		File configDir = new File("config");
 		if (!configDir.exists()) {
-			configDir.mkdirs(); // The result is ignored intentionally.
+			configDir.mkdirs();
 		}
+		JsonObject json = new JsonObject();
+		json.addProperty("requireIpValidation", requireIpValidation);
+		JsonObject playersObject = new JsonObject();
+		for (Map.Entry<String, AllowedPlayer> entry : allowedPlayers.entrySet()) {
+			JsonObject playerObj = new JsonObject();
+			playerObj.addProperty("verifyIp", entry.getValue().verifyIp);
+			JsonArray ipArray = new JsonArray();
+			for (String ip : entry.getValue().ips) {
+				ipArray.add(ip);
+			}
+			playerObj.add("ips", ipArray);
+			playersObject.add(entry.getKey(), playerObj);
+		}
+		json.add("allowedPlayers", playersObject);
 		try (FileWriter writer = new FileWriter(CONFIG_FILE)) {
-			GSON.toJson(playersToSave, writer);
+			GSON.toJson(json, writer);
 			LOGGER.info("Saved allowed player list to '{}'.", CONFIG_FILE);
 		} catch (IOException e) {
 			LOGGER.error("Error saving allowed player list to '{}': {}", CONFIG_FILE, e.getMessage());
 		}
 	}
 
+	// -------------- Command Methods --------------
+
 	public void addAllowedPlayer(String username) {
-		if (allowedPlayers.add(username)) {
-			LOGGER.info("Added '{}' to the authorized player list.", username);
+		if (!allowedPlayers.containsKey(username)) {
+			AllowedPlayer ap = new AllowedPlayer();
+			ap.verifyIp = requireIpValidation;
+			allowedPlayers.put(username, ap);
+			LOGGER.info("Added user '{}' to the allowed list (verifyIp={} ).", username, ap.verifyIp);
 			saveConfig();
 		} else {
-			LOGGER.warn("'{}' is already in the authorized player list.", username);
+			LOGGER.warn("User '{}' is already in the allowed list.", username);
 		}
 	}
 
 	public void removeAllowedPlayer(String username) {
-		if (allowedPlayers.remove(username)) {
-			LOGGER.info("Removed '{}' from the authorized player list.", username);
+		if (allowedPlayers.remove(username) != null) {
+			LOGGER.info("Removed user '{}' from the allowed list.", username);
 			saveConfig();
 		} else {
-			LOGGER.warn("'{}' was not found in the authorized player list.", username);
+			LOGGER.warn("User '{}' was not found in the allowed list.", username);
 		}
 	}
+
+	public void addAllowedIp(String username, String ip) {
+		AllowedPlayer ap = allowedPlayers.get(username);
+		if (ap == null) {
+			LOGGER.warn("User '{}' is not in the allowed list.", username);
+			return;
+		}
+		if (!ap.ips.contains(ip)) {
+			ap.ips.add(ip);
+			LOGGER.info("Added IP '{}' for user '{}'.", ip, username);
+			saveConfig();
+		} else {
+			LOGGER.warn("IP '{}' is already registered for user '{}'.", ip, username);
+		}
+	}
+
+	public void removeAllowedIp(String username, String ip) {
+		AllowedPlayer ap = allowedPlayers.get(username);
+		if (ap == null) {
+			LOGGER.warn("User '{}' is not in the allowed list.", username);
+			return;
+		}
+		if (ap.ips.remove(ip)) {
+			LOGGER.info("Removed IP '{}' for user '{}'.", ip, username);
+			saveConfig();
+		} else {
+			LOGGER.warn("IP '{}' was not registered for user '{}'.", ip, username);
+		}
+	}
+
+	public void toggleUserIpVerification(String username) {
+		AllowedPlayer ap = allowedPlayers.get(username);
+		if (ap == null) {
+			LOGGER.warn("User '{}' is not in the allowed list.", username);
+			return;
+		}
+		ap.verifyIp = !ap.verifyIp;
+		LOGGER.info("User '{}' IP verification toggled to {}.", username, ap.verifyIp);
+		saveConfig();
+	}
+
+	// -------------- Command Registration --------------
 
 	public void registerCommands(CommandDispatcher<ServerCommandSource> dispatcher) {
 		dispatcher.register(CommandManager.literal("addUser")
@@ -156,12 +347,36 @@ public class Swrpgservauth implements ModInitializer {
 				)
 		);
 
+		dispatcher.register(CommandManager.literal("toggleUserIp")
+				.requires(source -> source.hasPermissionLevel(4))
+				.then(CommandManager.argument("username", StringArgumentType.string())
+						.executes(context -> {
+							String username = StringArgumentType.getString(context, "username");
+							toggleUserIpVerification(username);
+							AllowedPlayer ap = allowedPlayers.get(username);
+							String status = (ap != null && ap.verifyIp) ? "enabled" : "disabled";
+							context.getSource().sendFeedback(() ->
+									Text.literal("User '" + username + "' IP verification is now " + status + ".").formatted(Formatting.AQUA), false);
+							return 1;
+						})
+				)
+		);
+
 		dispatcher.register(CommandManager.literal("listUsers")
 				.requires(source -> source.hasPermissionLevel(4))
 				.executes(context -> {
-					String users = String.join(", ", allowedPlayers);
+					StringBuilder sb = new StringBuilder();
+					allowedPlayers.forEach((user, ap) -> {
+						sb.append(user)
+								.append(" (verifyIp: ").append(ap.verifyIp)
+								.append(", IPs: ").append(ap.ips.isEmpty() ? "none" : String.join(", ", ap.ips))
+								.append("), ");
+					});
+					if (sb.length() >= 2) {
+						sb.setLength(sb.length() - 2);
+					}
 					context.getSource().sendFeedback(() ->
-							Text.literal("Allowed users: " + users).formatted(Formatting.YELLOW), false);
+							Text.literal("Allowed users: " + sb).formatted(Formatting.YELLOW), false);
 					return 1;
 				})
 		);
@@ -172,6 +387,60 @@ public class Swrpgservauth implements ModInitializer {
 					loadConfig();
 					context.getSource().sendFeedback(() ->
 							Text.literal("Configuration refreshed successfully.").formatted(Formatting.AQUA), false);
+					return 1;
+				})
+		);
+
+		dispatcher.register(CommandManager.literal("addIp")
+				.requires(source -> source.hasPermissionLevel(4))
+				.then(CommandManager.argument("username", StringArgumentType.string())
+						.then(CommandManager.argument("ip", StringArgumentType.string())
+								.executes(context -> {
+									String username = StringArgumentType.getString(context, "username");
+									String ip = StringArgumentType.getString(context, "ip");
+									if (!allowedPlayers.containsKey(username)) {
+										context.getSource().sendFeedback(() ->
+												Text.literal("User '" + username + "' is not in the allowed list.").formatted(Formatting.RED), false);
+										return 0;
+									}
+									addAllowedIp(username, ip);
+									context.getSource().sendFeedback(() ->
+											Text.literal("Added IP '" + ip + "' for user '" + username + "'.").formatted(Formatting.GREEN), false);
+									return 1;
+								})
+						)
+				)
+		);
+
+		dispatcher.register(CommandManager.literal("removeIp")
+				.requires(source -> source.hasPermissionLevel(4))
+				.then(CommandManager.argument("username", StringArgumentType.string())
+						.then(CommandManager.argument("ip", StringArgumentType.string())
+								.executes(context -> {
+									String username = StringArgumentType.getString(context, "username");
+									String ip = StringArgumentType.getString(context, "ip");
+									if (!allowedPlayers.containsKey(username)) {
+										context.getSource().sendFeedback(() ->
+												Text.literal("User '" + username + "' is not in the allowed list.").formatted(Formatting.RED), false);
+										return 0;
+									}
+									removeAllowedIp(username, ip);
+									context.getSource().sendFeedback(() ->
+											Text.literal("Removed IP '" + ip + "' for user '" + username + "'.").formatted(Formatting.RED), false);
+									return 1;
+								})
+						)
+				)
+		);
+
+		dispatcher.register(CommandManager.literal("toggleGlobalIp")
+				.requires(source -> source.hasPermissionLevel(4))
+				.executes(context -> {
+					requireIpValidation = !requireIpValidation;
+					saveConfig();
+					String status = requireIpValidation ? "enabled" : "disabled";
+					context.getSource().sendFeedback(() ->
+							Text.literal("Global IP validation is now " + status + ".").formatted(Formatting.AQUA), false);
 					return 1;
 				})
 		);
