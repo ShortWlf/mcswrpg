@@ -14,3 +14,5 @@ The mod features automated logging for connection attempts, notifying administra
 
 Single-Sentence Summary:
 Swrpgservauth enhances Minecraft server security by enforcing username-based authentication, disconnecting unauthorized players, and providing admin commands for managing access.
+
+Added optional IP verification. - global / or per user.
