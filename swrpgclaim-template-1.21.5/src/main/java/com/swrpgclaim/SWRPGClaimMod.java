@@ -135,6 +135,7 @@ public class SWRPGClaimMod implements ModInitializer {
 		CommandRegistrationCallback.EVENT.register((dispatcher, dedicated) -> {
 
 			// /claimarea - Player claims a flat area centered at their position.
+			// Updated to use the player's current coordinates.
 			dispatcher.register(CommandManager.literal("claimarea")
 					.requires(source -> source.hasPermissionLevel(0))
 					.executes(context -> {
@@ -143,7 +144,12 @@ public class SWRPGClaimMod implements ModInitializer {
 							context.getSource().sendError(Text.literal("This command can only be used by a player."));
 							return 0;
 						}
-						BlockPos pos = player.getBlockPos();
+
+						// Use player's current coordinates (using getX/Y/Z instead of getBlockPos)
+						int x = (int) Math.floor(player.getX());
+						int y = (int) Math.floor(player.getY());
+						int z = (int) Math.floor(player.getZ());
+
 						String playerName = player.getName().getString();
 						if (!config.playerClaims.containsKey(playerName)) {
 							context.getSource().sendFeedback(() ->
@@ -151,8 +157,12 @@ public class SWRPGClaimMod implements ModInitializer {
 							return 0;
 						}
 						int half = config.allowedClaimSize / 2;
-						ClaimConfig.ClaimedArea newClaim = new ClaimConfig.ClaimedArea(
-								pos.getX() - half, pos.getY(), pos.getZ() - half, config.allowedClaimSize);
+						// Calculate the claim's lower bound so that it is centered on the player's position.
+						int claimX = x - half;
+						int claimY = y;  // Adjust if needed (e.g., floor level)
+						int claimZ = z - half;
+
+						ClaimConfig.ClaimedArea newClaim = new ClaimConfig.ClaimedArea(claimX, claimY, claimZ, config.allowedClaimSize);
 						ClaimConfig.ClaimedArea oldClaim = config.playerClaims.get(playerName);
 						if (oldClaim != null && oldClaim.areaName != null && !oldClaim.areaName.isEmpty()) {
 							newClaim.areaName = oldClaim.areaName;
@@ -166,7 +176,7 @@ public class SWRPGClaimMod implements ModInitializer {
 						config.save();
 						context.getSource().sendFeedback(() ->
 								Text.literal("Area claimed for " + playerName + " centered on (" +
-										pos.getX() + ", " + pos.getY() + ", " + pos.getZ() + ")."), false);
+										x + ", " + y + ", " + z + ")."), false);
 						return 1;
 					})
 			);
@@ -216,7 +226,6 @@ public class SWRPGClaimMod implements ModInitializer {
 			);
 
 			// /refreshclaims - Reload configuration from disk.
-			// Only change: Now everyone can use it.
 			dispatcher.register(CommandManager.literal("refreshclaims")
 					.requires(source -> true)
 					.executes(context -> {
@@ -418,8 +427,9 @@ public class SWRPGClaimMod implements ModInitializer {
 			);
 
 			// /claimmax <playerName> <max> - Set per-player maximum claim size.
+			// Restricted to operators (permission level 2).
 			dispatcher.register(CommandManager.literal("claimmax")
-					.requires(source -> source.hasPermissionLevel(0))
+					.requires(source -> source.hasPermissionLevel(2))
 					.then(CommandManager.argument("playerName", StringArgumentType.word())
 							.then(CommandManager.argument("max", IntegerArgumentType.integer(1))
 									.executes(context -> {
@@ -454,13 +464,10 @@ public class SWRPGClaimMod implements ModInitializer {
 						// Calculate the center coordinates of the claim.
 						int centerX = claim.x + claim.size / 2;
 						int centerZ = claim.z + claim.size / 2;
-						int centerY = claim.y + 1; // Slight offset so that you don't suffocate in the floor.
+						int centerY = claim.y + 1; // Slight offset to avoid suffocation in the floor.
 
-						// Build the teleport command string.
-						// Adding .5 to the X and Z coordinates centers the player within the block.
+						// Build and execute the teleport command string.
 						String teleportCommand = "tp " + playerName + " " + (centerX + 0.5) + " " + centerY + " " + (centerZ + 0.5);
-
-						// Execute the teleport command using the server's command dispatcher.
 						var dispatcherInstance = player.getServer().getCommandManager().getDispatcher();
 						dispatcherInstance.execute(dispatcherInstance.parse(teleportCommand, context.getSource().getServer().getCommandSource()));
 
