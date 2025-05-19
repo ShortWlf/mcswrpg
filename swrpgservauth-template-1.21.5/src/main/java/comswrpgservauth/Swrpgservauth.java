@@ -5,12 +5,16 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.network.ClientConnection;
+import net.minecraft.server.MinecraftServer;
+// Import the ban entry type from your server API:
+import net.minecraft.server.BannedPlayerEntry;
 import net.minecraft.server.command.CommandManager;
 import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -36,23 +40,26 @@ public class Swrpgservauth implements ModInitializer {
 	public static final String MOD_ID = "swrpgservauth";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-	// Global flag: when true, if a player’s per-user flag is true then IP verification is enforced.
+	// Global flag: when true, if a player's per-user flag is true then IP verification is enforced.
 	private boolean requireIpValidation = true;
+	// Config options for unauthorized access handling.
+	private boolean banOnUnauthorized = true;
+	private boolean kickOnUnauthorized = true;
 
 	// Path to the configuration file.
 	private static final String CONFIG_FILE = "config/allowed_players.json";
 
-	// Allowed players are stored in a map from username to AllowedPlayer.
+	// Allowed players stored in a map mapping username to AllowedPlayer.
 	private final Map<String, AllowedPlayer> allowedPlayers = new HashMap<>();
 
-	// Default users – these are to be added on first run.
+	// Default users added first time.
 	private static final List<String> DEFAULT_PLAYERS = List.of("ShortWlf", "ExampleUser1", "AnotherPlayer");
 
 	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-	// Class to hold per-user allowed data.
+	// Class for allowed player's information.
 	public static class AllowedPlayer {
-		public boolean verifyIp = false;  // When true, this player's IP must match one of the allowed IPs.
+		public boolean verifyIp = false;  // When true, enforce IP matching for this player's connections.
 		public List<String> ips = new ArrayList<>();
 	}
 
@@ -66,33 +73,18 @@ public class Swrpgservauth implements ModInitializer {
 			ServerPlayerEntity player = handler.getPlayer();
 			String username = player.getName().getString();
 			AllowedPlayer entry = allowedPlayers.get(username);
+
 			if (entry == null) {
 				LOGGER.warn("Unauthorized player '{}' attempted to join.", username);
-				server.execute(() -> {
-					if (!player.isRemoved()) {
-						player.networkHandler.disconnect(
-								Text.literal("You are not authorized to join this server.").formatted(Formatting.RED)
-						);
-						server.getPlayerManager().remove(player);
-						LOGGER.warn("Unauthorized player '{}' has been disconnected.", username);
-					}
-				});
+				handleUnauthorized(player, "You are not authorized to join this server.", server);
 				return;
 			}
 
 			// If global validation is enabled and the user is flagged for IP verification, perform the check.
 			if (requireIpValidation && entry.verifyIp) {
 				if (entry.ips.isEmpty()) {
-					LOGGER.warn("User '{}' is flagged for IP verification but has no allowed IP set.", username);
-					server.execute(() -> {
-						if (!player.isRemoved()) {
-							player.networkHandler.disconnect(
-									Text.literal("No authorized IP set for your account.").formatted(Formatting.RED)
-							);
-							server.getPlayerManager().remove(player);
-							LOGGER.warn("Player '{}' has been disconnected due to lack of an authorized IP.", username);
-						}
-					});
+					LOGGER.warn("User '{}' flagged for IP verification but has no allowed IP set.", username);
+					handleUnauthorized(player, "No authorized IP set for your account.", server);
 					return;
 				}
 				SocketAddress socketAddress = getConnectionAddress(handler);
@@ -105,15 +97,7 @@ public class Swrpgservauth implements ModInitializer {
 				LOGGER.debug("User '{}' is connecting from IP: '{}'", username, ipAddress);
 				if (!entry.ips.contains(ipAddress)) {
 					LOGGER.warn("Unauthorized IP '{}' for user '{}'.", ipAddress, username);
-					server.execute(() -> {
-						if (!player.isRemoved()) {
-							player.networkHandler.disconnect(
-									Text.literal("Your IP address is not authorized for your account.").formatted(Formatting.RED)
-							);
-							server.getPlayerManager().remove(player);
-							LOGGER.warn("Player '{}' with unauthorized IP '{}' has been disconnected.", username, ipAddress);
-						}
-					});
+					handleUnauthorized(player, "Your IP address is not authorized for your account.", server);
 					return;
 				}
 			}
@@ -126,8 +110,44 @@ public class Swrpgservauth implements ModInitializer {
 	}
 
 	/**
-	 * Iterates through the ServerPlayNetworkHandler class hierarchy and returns
-	 * the first ClientConnection's address it finds.
+	 * Handles unauthorized access by kicking, banning, or both—depending on the configuration.
+	 *
+	 * @param player The player that attempted to join.
+	 * @param reason The reason provided for unauthorized access.
+	 * @param server The Minecraft server instance.
+	 */
+	private void handleUnauthorized(ServerPlayerEntity player, String reason, MinecraftServer server) {
+		server.execute(() -> {
+			if (kickOnUnauthorized && !player.isRemoved()) {
+				player.networkHandler.disconnect(Text.literal(reason).formatted(Formatting.RED));
+			}
+			if (banOnUnauthorized) {
+				try {
+					// Wrap the player's GameProfile in a proper ban entry.
+					BannedPlayerEntry banEntry = new BannedPlayerEntry(
+							player.getGameProfile(),
+							null,        // Ban date (null can default to the current time)
+							MOD_ID,      // Source
+							null,        // Expiration date; null means permanent
+							reason       // Reason
+					);
+					server.getPlayerManager().getUserBanList().add(banEntry);
+				} catch (Exception e) {
+					LOGGER.error("Failed to ban player '{}': {}", player.getGameProfile().getName(), e.getMessage());
+				}
+			}
+			if (kickOnUnauthorized) {
+				server.getPlayerManager().remove(player);
+			}
+			LOGGER.warn("Player '{}' has been handled as unauthorized. Reason: {}", player.getGameProfile().getName(), reason);
+		});
+	}
+
+	/**
+	 * Traverses the ServerPlayNetworkHandler class hierarchy to obtain the ClientConnection's address.
+	 *
+	 * @param handler The ServerPlayNetworkHandler instance.
+	 * @return the SocketAddress of the connection.
 	 */
 	private SocketAddress getConnectionAddress(ServerPlayNetworkHandler handler) {
 		Class<?> clazz = handler.getClass();
@@ -154,22 +174,17 @@ public class Swrpgservauth implements ModInitializer {
 	/**
 	 * Loads the configuration from the JSON file.
 	 *
-	 * The expected JSON format:
+	 * Expected JSON format:
 	 * {
 	 *   "requireIpValidation": true,
+	 *   "banOnUnauthorized": true,
+	 *   "kickOnUnauthorized": true,
 	 *   "allowedPlayers": {
-	 *       "ShortWlf": {
-	 *           "verifyIp": true,
-	 *           "ips": ["10.187.1.184"]
-	 *       },
-	 *       "ExampleUser1": {
-	 *           "verifyIp": false,
-	 *           "ips": []
-	 *       },
-	 *       "AnotherPlayer": {
-	 *           "verifyIp": false,
-	 *           "ips": []
-	 *       }
+	 *     "Username": {
+	 *       "verifyIp": true,
+	 *       "ips": ["ip1", "ip2"]
+	 *     },
+	 *     ...
 	 *   }
 	 * }
 	 */
@@ -179,6 +194,9 @@ public class Swrpgservauth implements ModInitializer {
 			try (FileReader reader = new FileReader(configFile)) {
 				JsonObject json = GSON.fromJson(reader, JsonObject.class);
 				requireIpValidation = json.has("requireIpValidation") && json.get("requireIpValidation").getAsBoolean();
+				banOnUnauthorized = json.has("banOnUnauthorized") ? json.get("banOnUnauthorized").getAsBoolean() : true;
+				kickOnUnauthorized = json.has("kickOnUnauthorized") ? json.get("kickOnUnauthorized").getAsBoolean() : true;
+
 				JsonObject playersObject = json.getAsJsonObject("allowedPlayers");
 				if (playersObject != null && !playersObject.entrySet().isEmpty()) {
 					allowedPlayers.clear();
@@ -210,11 +228,12 @@ public class Swrpgservauth implements ModInitializer {
 	}
 
 	/**
-	 * Creates a default configuration.
-	 * Users are added with their verifyIp flag set to the global flag and an empty IP list.
+	 * Creates a default configuration, initializing default users with IP verification enabled.
 	 */
 	private void setDefaultConfig() {
 		requireIpValidation = true;
+		banOnUnauthorized = true;
+		kickOnUnauthorized = true;
 		allowedPlayers.clear();
 		for (String user : DEFAULT_PLAYERS) {
 			AllowedPlayer ap = new AllowedPlayer();
@@ -226,7 +245,7 @@ public class Swrpgservauth implements ModInitializer {
 	}
 
 	/**
-	 * Saves the configuration to the JSON file.
+	 * Saves the current configuration to the JSON file.
 	 */
 	public void saveConfig() {
 		File configDir = new File("config");
@@ -235,6 +254,8 @@ public class Swrpgservauth implements ModInitializer {
 		}
 		JsonObject json = new JsonObject();
 		json.addProperty("requireIpValidation", requireIpValidation);
+		json.addProperty("banOnUnauthorized", banOnUnauthorized);
+		json.addProperty("kickOnUnauthorized", kickOnUnauthorized);
 		JsonObject playersObject = new JsonObject();
 		for (Map.Entry<String, AllowedPlayer> entry : allowedPlayers.entrySet()) {
 			JsonObject playerObj = new JsonObject();
