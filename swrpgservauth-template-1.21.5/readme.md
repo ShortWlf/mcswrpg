@@ -1,3 +1,32 @@
+Change Log
+--
+Configuration Enhancements:
+New Options Added: Introduced two new JSON config options:
+banOnUnauthorized: When set to true, unauthorized users are added to the server's ban list.
+kickOnUnauthorized: When set to true, unauthorized users are kicked from the server.
+Config Format Update: Updated the configuration file structure to include these options alongside requireIpValidation and the allowedPlayers list.
+Config Fixes: Corrected formatting issues in the config (e.g., removed the trailing colon from the IP address for "WooTiPanTz").
+
+Authorization Logic Updates:
+Unauthorized Access Handling: Modified the join event handler so that if a player is not on the allowed list or connects with an unapproved IP:
+The mod now calls a new helper method (handleUnauthorized) that checks the config flags and either kicks, bans, or both.
+Conditional Punishment: The behavior (kick, ban, or both) is now determined by the new config options, making the security response fully customizable.
+
+Ban System Bug Fix:
+Ban Entry Correction: Resolved a type mismatch error by wrapping a player's GameProfile into a proper BannedPlayerEntry before adding it to the ban list.
+Previous error: Attempting to add a GameProfile directly.
+New implementation: Creating a BannedPlayerEntry with the player's profile, source, and reason.
+
+Logging Improvements:
+Enhanced Logging: Added more descriptive logging messages to track:
+Unauthorized access attempts.
+Punishment actions (kicks and bans) performed on players.
+
+Command Registration:
+Various Commands: Included commands like /addUser, /removeUser, /toggleUserIp, /addIp, /removeIp, and /refreshConfig to manage the allowed players list dynamically.
+Global IP Validation Toggle: A command (/toggleGlobalIp) was added to enable or disable IP validation server-wide.
+--
+
 Swrpgservauth is a Minecraft server authentication mod that restricts player access based on a predefined username allowlist. The mod prevents unauthorized players from joining by checking their username against a configuration file (allowed_players.json). If a player is not listed, they are disconnected upon joining, ensuring tight control over server access.
 
 Administrators can manage the allowlist through commands:
